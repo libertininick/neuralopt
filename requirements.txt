@@ -1,0 +1,7 @@
+beautifulsoup4
+numpy
+matplotlib
+requests
+scipy
+scikit-learn
+torch
