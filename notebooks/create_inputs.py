@@ -32,55 +32,151 @@ mpl.rcParams['axes.facecolor'] = 'white'
 
 DATA_PATH = '../../../Investing Models/Price data'
 
-# +
+
+# -
+
+# # Data transform
+
+def transform(df, n_forward=40):
+    """Transforms raw price data to model inputs
+    
+    Args:
+        df (DataFrame): Raw price inputs
+        n_forward (int): Number of forward looking returns
+        
+    Returns:
+        df (DataFrame): Transformed inputs
+    """
+    
+    # Calculate adjustment factor
+    df['adj_factor'] = df['Adj Close']/df['Close']
+    df['Adj High'] = df['adj_factor']*df['High']
+    df['Adj Low'] = df['adj_factor']*df['Low']
+
+    # Raw returns
+    df['return'] = df['Adj Close'].pct_change(periods=1)
+    df['high_to_close'] = df['Adj High']/df['Adj Close'] - 1
+    df['low_to_close'] = df['Adj Low']/df['Adj Close'] - 1
+
+    # Rolling 120d returns
+    df['return_120d'] = df['return'].ewm(span=120).mean()
+    df['high_to_close_120d'] = df['high_to_close'].ewm(span=120).mean()
+    df['low_to_close_120d'] = df['low_to_close'].ewm(span=120).mean()
+
+    # Average true range
+    df['prev_close'] = df['Adj Close'].shift(periods=1)
+    df['true_range'] = np.maximum(df['prev_close'], df['Adj High'])/np.minimum(df['prev_close'], df['Adj Low']) - 1
+    df['atr_20d'] = df['true_range'].ewm(span=20).mean()
+    df['stdtr_20d'] = df['true_range'].ewm(span=20).std()
+    df['true_range_norm'] = (df['true_range'] - df['atr_20d'])/df['stdtr_20d']
+    df['atr_3yr_pct'] = df['atr_20d'].rolling(250*3).apply(lambda x: (x.tail(1) - np.min(x))/(np.max(x) - np.min(x)))
+
+    # Normalize returns based on rolling 120-day mean and rolling 20-day average true range
+    df['return_norm'] = (df['return'] - df['return_120d'])/df['atr_20d']
+    df['high_to_close_norm'] = (df['high_to_close'] - df['high_to_close_120d'])/df['atr_20d']
+    df['low_to_close_norm'] = (df['low_to_close'] - df['low_to_close_120d'])/df['atr_20d']
+
+    # Forward looking returns
+    for step in range(1, n_forward + 1):
+        forward_return = df['Adj Close'].shift(periods=-step)/df['Adj Close'] - 1
+        scaled_mean = df['return_120d']*step
+        scaled_dev = df['atr_20d']*step**0.5
+        forward_norm = (forward_return - scaled_mean)/scaled_dev
+        df[f'return_t{step}'] = forward_norm
+            
+    # Drop NA rows
+    df = df.dropna(how='any', axis='rows')
+
+    # Select columns
+    cols = [
+        'Date',
+        'Symbol',
+        'return_120d',
+        'atr_20d',
+        'return_norm',
+        'high_to_close_norm',
+        'low_to_close_norm',
+        'true_range_norm',
+        'atr_3yr_pct',
+    ]
+    cols += [f'return_t{step}' for step in range(1, n_forward + 1)]
+    df = df.loc[:, cols]
+    
+    return df
+
+
 df = pd.read_csv(f'{DATA_PATH}/PCG.csv')
-df['return'] = df['Adj Close'].pct_change(periods=1)
-df['high_to_close'] = df['High']/df['Close'] - 1
-df['low_to_close'] = df['Low']/df['Close'] - 1
+df = transform(df)
 
-# Rolling 120d return
-df['return_120d'] = df['return'].rolling(120).mean()
+# +
+fig, ax = plt.subplots(figsize=(15,10))
 
-# Average true range
-df['prev_close'] = df['Adj Close'].shift(periods=1)
-df['true_range'] = np.maximum(df['prev_close'], df['High'])/np.minimum(df['prev_close'], df['Low']) - 1
-df['true_range_pct'] = df['true_range'].rolling(20).apply(lambda x: (x.tail(1) - np.min(x))/(np.max(x) - np.min(x)))
-df['atr_20d'] = df['true_range'].rolling(20).mean()
-df['atr_3yr_pct'] = df['atr_20d'].rolling(250*3).apply(lambda x: (x.tail(1) - np.min(x))/(np.max(x) - np.min(x)))
+_ = ax.plot(df['atr_20d'])
 
-# Normalize returns based on rolling 20-day average true range
-df['return_norm'] = df['return']/df['atr_20d'].shift(periods=1)
-df['high_to_close_norm'] = df['high_to_close']/df['atr_20d'].shift(periods=1)
-df['low_to_close_norm'] = df['low_to_close']/df['atr_20d'].shift(periods=1)
+# +
+fig, ax = plt.subplots(figsize=(15,10))
+_ = ax.hist(df['return_t1'], bins=100, alpha=0.5, label='t1')
+_ = ax.hist(df['return_t2'], bins=100, alpha=0.5, label='t2')
+_ = ax.hist(df['return_t5'], bins=100, alpha=0.5, label='t5')
+_ = ax.hist(df['return_t10'], bins=100, alpha=0.5, label='t10')
+_ = ax.hist(df['return_t20'], bins=100, alpha=0.5, label='t20')
+_ = ax.hist(df['return_t40'], bins=100, alpha=0.5, label='t40')
 
-# Forward looking returns
-for step in range(1, 41):
-    df[f'return_t{step}'] = ((df['Adj Close'].shift(periods=-step)/df['Adj Close'] - 1) - df['return_120d']*step)/(df['atr_20d']*(step**0.5))
+_ = ax.legend()
+# -
 
-# Drop NA rows
-df = df.dropna(how='any', axis='rows')
+fig, ax = plt.subplots(figsize=(10,5))
+_ = ax.hist(df['true_range_norm'], bins=100)
+
+np.mean(df['return_norm']), np.std(df['return_norm'])
+
+
+# # Sample from bins function
+
+def sample_from_bins(n, bins, bin_ppfs):
+    """Random sample using linear interpolation between bins based on bin ppfs
+    
+    Args:
+        n (int): Number of samples
+        bins (ndarray): Bin thresholds (<=)
+        bin_ppfs (ndarray): Emperical or predicted ppf for each bin
+    """
+    
+    # Sample uniform random numbers
+    x = np.random.rand(n)
+    
+    # Find upper and lower bin indexes for each random draw based on ppfs
+    u_idx = np.searchsorted(bin_ppfs, x, side='left', sorter=None)
+    l_idx = u_idx - 1
+    
+    # PPFs
+    u_ppf = bin_ppfs[u_idx]
+    l_ppf = bin_ppfs[l_idx]
+    
+    # Values based on linear interpolation between upper and lower bins
+    u_bin = bins[u_idx]
+    l_bin = bins[l_idx]
+    interp_pct = (x - l_ppf)/(u_ppf - l_ppf)
+    values = (u_bin - l_bin)*interp_pct + l_bin
+    
+    return values
+
+
+# +
+from scipy.stats import norm
+
+bins = [-10, -7.5, -5] + [norm.ppf(i) for i in np.linspace(0.001, 0.499, 22)]
+bins += [0] + [-b for b in bins[::-1]]
+bins = np.array(bins)
+bin_ppfs = np.array([np.mean(df['return_t10'] <= b) for b in bins])
 # -
 
 
 
-bins = [7.5/(1.5**i) for i in range(15)]
-bins = np.array([-b for b in bins] + [0] + bins[::-1])
-# bins = np.quantile(df['return_t10'], q=np.linspace(0,1,100))
-bin_threshs = np.array([np.mean(df['return_t10'] <= b) for b in bins])
-for i, b in enumerate(bins):
-    print(f'''{i:<3} {b:>8.4f}: {np.mean(df['return_t10'] <= b):>10.4%}''')
-
-x = np.random.rand(10000)
-u_idx = np.searchsorted(bin_threshs, x, side='left', sorter=None)
-l_idx = u_idx - 1
-u_thresh = bin_threshs[u_idx]
-l_thresh = bin_threshs[l_idx]
-u_value = bins[u_idx]
-l_value = bins[l_idx]
-interp_pct = (x - l_thresh)/(u_thresh - l_thresh)
-v = (u_value - l_value)*interp_pct + l_value
+v = sample_from_bins(len(df['return_t10']), bins, bin_ppfs)
 fig, ax = plt.subplots(figsize=(10,5))
-_ = ax.hist(v, bins=100)
+_ = ax.hist(df['return_t10'], bins=100, alpha=0.5)
+_ = ax.hist(v, bins=100, alpha=0.5, color='orange')
 
 fig, ax = plt.subplots(figsize=(10,5))
 q =  np.quantile(df['return_t10'], q=np.linspace(0.01,0.99,40))
@@ -90,12 +186,6 @@ _ = ax.scatter(
     q,
     np.quantile(v, q=np.linspace(0.01,0.99,40))
 )
-
-fig, ax = plt.subplots(figsize=(10,5))
-_ = ax.hist(df['return_t1'], bins=100)
-_ = ax.hist(df['return_t2'], bins=100)
-_ = ax.hist(df['return_t5'], bins=100)
-_ = ax.hist(df['return_t10'], bins=100)
 
 fig, ax = plt.subplots(figsize=(10,5))
 _ = ax.hist(df['return_norm'], bins=100)
