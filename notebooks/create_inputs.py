@@ -30,10 +30,14 @@ mpl.rcParams['axes.spines.right'] = False
 mpl.rcParams['figure.facecolor'] = 'white'
 mpl.rcParams['axes.facecolor'] = 'white'
 
-DATA_PATH = '../../../Investing Models/Price data'
-
-
+DATA_PATH = '../../../Investing Models'
 # -
+
+# # Load earnings data
+
+df_earnings = pd.read_csv(f'{DATA_PATH}/earnings_data_all.csv')
+df_earnings.info()
+
 
 # # Data transform
 
@@ -105,7 +109,78 @@ def transform(df, n_forward=40):
     return df
 
 
-df = pd.read_csv(f'{DATA_PATH}/PCG.csv')
+df = pd.read_csv(f'{DATA_PATH}/Price data/AAPL.csv')
+
+earnings_dates = pd.to_datetime(df_earnings.query('''Symbol == 'AAPL' ''')['Date']).values
+
+dates = pd.to_datetime(df['Date']).values
+
+# +
+from scipy.spatial.distance import cdist
+
+def calc_earnings_dists(dates, earnings_dates):
+    """Calculates the number of calendar days since the last earnings release
+    and the number of days until the next earnings for each date in `dates`
+    
+    Args:
+        dates (ndarray): Sequence of trading dates
+        earnings_dates (ndarray): Earnings release dates
+    """
+    
+    days = cdist(
+        dates[:, None], 
+        earnings_dates[:, None], 
+        lambda a,b: (b - a)/np.timedelta64(1, 'D')
+    )
+    
+    days_since = np.abs(np.max(np.where(days <= 0, days, -np.inf), axis=-1))
+    days_until = np.min(np.where(days >= 0, days, np.inf), axis=-1)
+    
+    return days_since, days_until
+
+
+# -
+
+days_since, days_until = calc_earnings_dists(dates, earnings_dates)
+
+fig, ax = plt.subplots(figsize=(10,5))
+_ = ax.plot(days_since)
+
+days_since[-20:]
+
+df['is_earnings_date'] = np.isin(df['Date'], earnings_dates)
+
+first_earnings_dt = df.loc[df['is_earnings_date'], 'Date'].min()
+first_earnings_dt
+
+days_post = []
+ct = 0
+for x in df.loc[df['Date'] >= first_earnings_dt, 'is_earnings_date']:
+    if x:
+        ct = 0
+    else:
+        ct += 1
+    
+    days_post.append(ct)
+
+# +
+days_pre = []
+ct = 0
+for x in df.loc[df['Date'] >= first_earnings_dt, 'is_earnings_date'][::-1]:
+    if x:
+        ct = 0
+    else:
+        ct += 1
+    
+    days_pre.append(ct)
+    
+days_pre = days_pre[::-1]
+# -
+
+for a,b in zip(days_post,days_pre):
+    print(a, b)
+
+df = pd.read_csv(f'{DATA_PATH}/Price data/PCG.csv')
 df = transform(df)
 
 # +
