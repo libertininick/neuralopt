@@ -6,7 +6,7 @@
 #       extension: .py
 #       format_name: light
 #       format_version: '1.5'
-#       jupytext_version: 1.8.0
+#       jupytext_version: 1.9.1
 #   kernelspec:
 #     display_name: neuralopt_env
 #     language: python
@@ -98,7 +98,7 @@ for i, dt in enumerate(dates, 1):
     result = scrape_earnings_date(dt)
     if result is not None:
         # Save
-        result.to_csv(f'../../../Investing Models/Earnings data/{date}.csv')
+        result.to_csv(f'../../../Investing Models/Data/Earnings/{date}.csv')
         
         # Randomly sleep
         time.sleep(random.randint(0,10))
@@ -111,7 +111,7 @@ for i, dt in enumerate(dates, 1):
 
 # +
 dfs = []
-for f in glob.glob('../../../Investing Models/Earnings data/*.csv'):
+for f in glob.glob('../../../Investing Models/Data/Earnings/*.csv'):
     m = re.findall(r'[0-9]{4}-[0-9]{2}-[0-9]{2}', f)
     if m:
         date = m[0]
@@ -120,7 +120,6 @@ for f in glob.glob('../../../Investing Models/Earnings data/*.csv'):
         df['Date'] = date
 
         df = df[['Date', 'Company', 'Symbol', 'EPS Estimate', 'Reported EPS']]
-        df = df.groupby('Company').apply(lambda g: g.sort_values(by='Symbol').iloc[0])
         df.index = np.arange(len(df))
         
         dfs.append(df)
@@ -129,7 +128,7 @@ all_earnings_data = pd.concat(dfs, axis='rows')
 
 # Save
 all_earnings_data.to_csv(
-    f'../../../Investing Models/Earnings data/all_earnings_data.csv',
+    f'../../../Investing Models/Data/Earnings/all_earnings_data.csv',
     index=False
 )
 
@@ -156,7 +155,7 @@ def scrape_price_data(ticker, date_from, date_to):
         if len(price_table):
             price_table['Symbol'] = ticker
             price_table.to_csv(
-                f'../../../Investing Models/Price data/{ticker}.csv',
+                f'../../../Investing Models/Data/Prices/{ticker}.csv',
                 index=False
             )
             return True
@@ -169,15 +168,15 @@ def scrape_price_data(ticker, date_from, date_to):
 # ## Compile tickers from earnings dates
 
 # +
-df_earnings = pd.read_csv(f'../../../Investing Models/Earnings data/all_earnings_data.csv')
+df_earnings = pd.read_csv(f'../../../Investing Models/Data/Earnings/all_earnings_data.csv')
 tickers = np.unique(df_earnings['Symbol'])
 print(f'All tickers: {len(tickers):,}')
 
 # Data already saved
 tickers_old = [
-    f.replace('../../../Investing Models/Price data\\', '').replace('.csv', '')
+    f.replace('../../../Investing Models/Data/Prices\\', '').replace('.csv', '')
     for f 
-    in glob.glob('../../../Investing Models/Price data/*.csv')
+    in glob.glob('../../../Investing Models/Data/Prices/*.csv')
 ]
 
 print(f'Old tickers: {len(tickers_old):,}')
@@ -191,6 +190,49 @@ print(f'New tickers: {len(tickers_new):,}')
 
 for ticker in tickers_new:
     result = scrape_price_data(ticker, '1995-12-31', '2020-11-30')
+
+    # Randomly sleep
+    time.sleep(random.randint(0,10))
+    
+    print(ticker, result)
+# # Scrape dividends
+def scrape_div_data(ticker, date_from, date_to):
+    reference_date = '1995-12-30'
+    reference_period = 820368000
+    day_scale = 86400
+    
+    dt0 = datetime.strptime(reference_date, '%Y-%m-%d')
+    dt1 = datetime.strptime(date_from, '%Y-%m-%d')
+    dt2 = datetime.strptime(date_to, '%Y-%m-%d')
+    
+    period1 = (dt1 - dt0).days*day_scale + reference_period
+    period2 = (dt2 - dt0).days*day_scale + reference_period
+
+    url = f'https://query1.finance.yahoo.com/v7/finance/download/{ticker}?period1={period1}&period2={period2}&interval=1d&events=div'
+    try:
+        div_table = pd.read_csv(url)
+        if len(div_table):
+            div_table['Symbol'] = ticker
+            div_table.to_csv(
+                f'../../../Investing Models/Data/Dividends/{ticker}.csv',
+                index=False
+            )
+            return True
+    except:
+        pass
+    
+    return False
+
+
+for file in glob.glob(f'../../../Investing Models/Data/Prices/*.csv'):
+    # Load price data
+    df = pd.read_csv(file)
+    
+    # From, To dates
+    ticker = df['Symbol'][0]
+    date_from, date_to = min(df['Date']), max(df['Date'])
+    
+    result = scrape_div_data(ticker, date_from, date_to)
 
     # Randomly sleep
     time.sleep(random.randint(0,10))
