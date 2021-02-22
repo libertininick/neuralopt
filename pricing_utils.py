@@ -74,6 +74,35 @@ def sample_bsm_future_return_distribution(
     return returns
 
 
+def sample_from_bins(n, bins, bin_ppfs):
+    """Random sample using linear interpolation between bins based on bin ppfs
+    
+    Args:
+        n (int): Number of samples
+        bins (ndarray): Bin thresholds (<=)
+        bin_ppfs (ndarray): Emperical or predicted ppf for each bin
+    """
+    
+    # Sample uniform random numbers
+    x = np.random.rand(n)
+    
+    # Find upper and lower bin indexes for each random draw based on ppfs
+    u_idx = np.searchsorted(bin_ppfs, x, side='left', sorter=None)
+    l_idx = u_idx - 1
+    
+    # PPFs
+    u_ppf = bin_ppfs[u_idx]
+    l_ppf = bin_ppfs[l_idx]
+    
+    # Values based on linear interpolation between upper and lower bins
+    u_bin = bins[u_idx]
+    l_bin = bins[l_idx]
+    interp_pct = (x - l_ppf)/(u_ppf - l_ppf)
+    values = (u_bin - l_bin)*interp_pct + l_bin
+    
+    return values
+
+
 def price_call_bsm(
     spot, 
     strike, 
@@ -103,7 +132,7 @@ def price_call_bsm(
         trading_days_in_yr (float, optional): Total number of trading days in the year
         
     Returns:
-        price (float)
+        price (float), delta (float)
     """
     
     # Fraction of year until option expiration
@@ -126,7 +155,7 @@ def price_call_bsm(
     price = spot_dvd_adj*norm.cdf(d1)
     price -= strike*np.exp(-risk_free_rate_optexp*t_optexp_calendar)*norm.cdf(d2)
     
-    return price
+    return price, norm.cdf(d1)
 
 
 def price_put_bsm(
@@ -158,7 +187,7 @@ def price_put_bsm(
         trading_days_in_yr (float, optional): Total number of trading days in the year
         
     Returns:
-        price (float)
+        price (float), delta (float)
     """
     
     # Fraction of year until option expiration
@@ -181,7 +210,7 @@ def price_put_bsm(
     price = strike*np.exp(-risk_free_rate_optexp*t_optexp_calendar)*norm.cdf(-d2)
     price -= spot_dvd_adj*norm.cdf(-d1)
     
-    return price
+    return price, norm.cdf(d1) - 1
 
 
 def price_call_pcp(
@@ -291,13 +320,17 @@ def price_callput_replicating(
     
     # Adjust spot for discrete dividend
     spot_dvd_adj = adj_spot_for_dvd(spot, dvd_amts, risk_free_rates_exdvd, cdays_exdvds)
+
+    # Normalize spot to $1 and strike correspondingly
+    spot_norm = 1
+    strike_norm = strike/spot_dvd_adj
     
     # Future prices
-    future_prices = spot_dvd_adj*(future_return_distribution + 1)
+    future_prices = spot_norm*(future_return_distribution + 1)
     
     # Call and put payoffs from future prices
-    call_payoffs = np.maximum(future_prices - strike, 0)
-    put_payoffs = np.maximum(strike - future_prices, 0)
+    call_payoffs = np.maximum(future_prices - strike_norm, 0)
+    put_payoffs = np.maximum(strike_norm - future_prices, 0)
     
     # Function to minimize
     def _replicating_errors(parms):
@@ -320,8 +353,9 @@ def price_callput_replicating(
     # Minimize
     res = minimize(
         fun=_replicating_errors,
-        x0=[0.5, spot_dvd_adj, spot_dvd_adj],
-        bounds=[(0,1), (0, spot_dvd_adj*100), (0, spot_dvd_adj*100)]
+        x0=[0.5, 0.5, 0.5],
+        bounds=[(0,1), (0, max(2, strike_norm*2)), (0, max(2, strike_norm*2))],
+        tol=1e-6,
     )
 
     if res.success:
@@ -333,9 +367,9 @@ def price_callput_replicating(
         loan = future_loan*discount_factor
         
         # Set prices to present value of replicating portfolios
-        call_price = spot_dvd_adj*call_delta - borrow
-        put_price = spot_dvd_adj*put_delta + loan
+        call_price = spot_norm*call_delta - borrow
+        put_price = spot_norm*put_delta + loan
         
-        return (call_price, call_delta, borrow), (put_price, put_delta, loan)
+        return (call_price*spot_dvd_adj, call_delta), (put_price*spot_dvd_adj, put_delta)
     else:
         return None
