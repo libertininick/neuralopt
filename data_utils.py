@@ -1,5 +1,6 @@
 import calendar
 import glob
+import re
 
 import numpy as np
 import pandas as pd
@@ -40,6 +41,32 @@ def calc_earnings_markers(trading_dates, earnings_dates):
         earnings_markers[after_idx] = 'After'
     
     return earnings_markers
+
+
+def auto_corr_randn(n, auto_corr, rnd=None, seed=None):
+    """Generate `n` normally distributed random numbers with autocorrelation of `auto_corr`
+    Args:
+        n (int): Number of random numbers to generate
+        auto_corr (float): 1 period autocorrelation between numbers (-1,1)
+        rnd (RandomState, optional): NumPy RandomState
+        seed (int, optional): Seed for RandomState
+
+    Returns:
+        auto_corr_rands (ndarray)
+    """
+    if rnd is None:
+        rnd = np.random.RandomState(seed)
+
+    rand_norms = rnd.randn(n + 1)
+    
+    auto_corr_rands = []
+    prev_norm = rand_norms[0]
+    for norm in rand_norms[1:]:
+        norm = prev_norm*auto_corr + (1 - auto_corr**2)**0.5*norm
+        auto_corr_rands.append(norm)
+        prev_norm = norm
+        
+    return np.array(auto_corr_rands)
 
 
 def rolling_window(a, window):
@@ -115,7 +142,7 @@ def transform_prices(df_prices, mean_window=260, std_window=10):
     df_out = df_prices.fillna(method='ffill')
     
     # Calendar markers
-    df_out['month'] = df_out.index.month
+    df_out['month'] = df_out.index.month - 1
     dow_mapper = {
             'Monday': 0,
             'Tuesday': 1,
@@ -221,6 +248,24 @@ def get_data_splits(data_dir, st_date, end_date, window_len, buffer, p_valid):
 
     Returns:
         splits (list): Sequence of data splits
+
+    Example:
+        splits = get_data_splits(
+            data_dir='../../../Investing Models/Data/Price Transforms',
+            st_date='2018-12-31',
+            end_date='2020-12-31',
+            window_len=280+65,
+            buffer=30,
+            p_valid=0.1
+        )
+
+        >> splits[0]
+        {'buffer_st': Timestamp('2018-12-31 00:00:00', freq='D'),
+        'valid_st': Timestamp('2019-01-30 00:00:00', freq='D'),
+        'valid_end': Timestamp('2020-01-10 00:00:00', freq='D'),
+        'buffer_end': Timestamp('2020-02-09 00:00:00', freq='D'),
+        'files_valid': ['../../../Investing Models/Data/Price Transforms/CERN.pkl', ...],
+        'files_train': ['../../../Investing Models/Data/Price Transforms/AVGO.pkl', ...]}
     """
     # Start and end of each ticker
     date_spans = []
@@ -245,6 +290,7 @@ def get_data_splits(data_dir, st_date, end_date, window_len, buffer, p_valid):
     # Validation dates
     validation_dates = get_validation_dates(st_date, end_date, window_len, buffer)
     
+    p = re.compile(r'[^\\\\|\/]{1,100}(?=\.pkl$)')
     splits = []
     for block in validation_dates:
         mask = np.logical_and(
@@ -253,7 +299,17 @@ def get_data_splits(data_dir, st_date, end_date, window_len, buffer, p_valid):
         )
         files_valid = list(date_spans.loc[mask,'file'].sample(n=n_valid).values)
         files_train = list(set(date_spans['file'].values).difference(files_valid))
-        splits.append({**block, **{'files_valid': files_valid,'files_train': files_train}})
+        symbols_valid = [p.findall(file)[0] for file in files_valid]
+        symbols_train = [p.findall(file)[0] for file in files_train]
+        splits.append({
+            **block, 
+            **{
+                'files_valid': files_valid,
+                'files_train': files_train,
+                'symbols_valid': symbols_valid,
+                'symbols_train': symbols_train,
+            }
+        })
         
     return splits
 
@@ -612,6 +668,37 @@ class FinancialStatementsDataset(Dataset):
 
 
 class PriceSeriesDataset(Dataset):
+    """Price Series Dataset
+
+    Examples:
+        dataset = PriceSeriesDataset(
+            symbols=split['symbols_train'],
+            files=split['files_train'],
+            date_A=split['buffer_st'],
+            date_B=split['buffer_end'],
+            range_type='exclude', 
+            n_historical=280,
+            n_future=10,
+        )
+
+        >> dataset[0]
+        {'historical_seq_emb': tensor([[8,  3, 20,  1], ...]]),
+         'historical_seq_masked': tensor([[ 0.0000,  0.0000,  0.0000,  0.0000,  0.0000], ...]]),
+         'future_seq_emb': tensor([[10,  3,  5, 16], ...]]),
+         'historical_seq': tensor([[ 0.9524,  0.7966,  1.0035,  0.0510,  0.7732], ...]]),
+         'future_targets': tensor([[0., 0., ...]])}
+
+        >> dataset.__getitem__(0, 'AMZN')
+
+
+        from torch.utils.data import DataLoader
+
+        loader = DataLoader(dataset, batch_size=16, shuffle=False)
+        batch = next(iter(loader))
+
+        for batch in loader:
+             ...
+    """
     def __init__(
         self,
         symbols,
@@ -623,6 +710,7 @@ class PriceSeriesDataset(Dataset):
         n_future=65, 
         n_targets=51,
         p_mask=0.2,
+        mask_auto_corr=0.9,
         seed=1234):
         """
         Args:
@@ -635,6 +723,7 @@ class PriceSeriesDataset(Dataset):
             n_future (int): Number of trading days to predict into the future
             n_targets (int): Number of CDF slices to predict for each future time step
             p_mask (float): Percentage of trading days to mask
+            mask_auto_corr (float): 1-period autocorrelation between masking probabilities
             seed (int): Random state
         """
         self.date_A = date_A
@@ -644,6 +733,10 @@ class PriceSeriesDataset(Dataset):
         self.n_future = n_future
         self.window_len = n_historical + n_future
         self.n_targets = n_targets
+        self.p_mask = p_mask
+        self.mask_auto_corr = mask_auto_corr
+        self.rnd = np.random.RandomState(seed)
+        
         self.target_thresholds = norm.ppf(np.linspace(0.001, 0.999, n_targets))
         
         self.cols_emb = [
@@ -680,8 +773,10 @@ class PriceSeriesDataset(Dataset):
         if symbol:
             file, st_idx, end_idx = self.symbol_windows[symbol][idx]
         else:
-            file, st_idx, end_idx = self.items[idx]
+            file, st_idx, end_idx = self.all_windows[idx]
+        
         df = pd.read_pickle(file)
+        
         return self._get_inputs(df.iloc[st_idx:end_idx].copy(deep=False))
     
     def _get_rolling_window_idxs(self, df):
@@ -699,24 +794,27 @@ class PriceSeriesDataset(Dataset):
         "Partition transformed DataFrame into input and target tensors"
         
         historical_seq_emb = torch.tensor(df.iloc[:self.n_historical][self.cols_emb].values, dtype=torch.long)
-        historical_seq_float = torch.tensor(df.iloc[:self.n_historical][self.cols_float].values, dtype=torch.float)
         future_seq_emb = torch.tensor(df.iloc[self.n_historical:][self.cols_emb].values, dtype=torch.long)
 
-        rfr, mean, std = df.iloc[self.n_historical - 1][self.cols_norm].values
-        daily_rfr = np.exp(rfr/252) - 1
-        future_rets = np.log(df.iloc[self.n_historical:]['return'].values + 1)
-        excess_rets = future_rets - daily_rfr - mean
-        cumulative_rets = np.exp(np.cumsum(excess_rets)) - 1
-        normalized_rets = cumulative_rets/(std*np.sqrt(np.arange(self.n_future) + 1))
-        targets = torch.from_numpy(np.stack([
-            (normalized_rets <= t).astype(np.float32)
+        historical_seq = df.iloc[:self.n_historical][self.cols_float].values
+        mask = norm.cdf(auto_corr_randn(self.n_historical, self.mask_auto_corr, self.rnd)) <= self.p_mask
+        historical_seq_masked = historical_seq.copy()
+        historical_seq_masked[mask] = 0
+        
+        historical_seq = torch.tensor(historical_seq, dtype=torch.float)
+        historical_seq_masked = torch.tensor(historical_seq_masked, dtype=torch.float)
+        
+        cumulative_CC_norms = np.cumsum(df.iloc[self.n_historical:]['CC_norm'].values)/(np.arange(self.n_future) + 1)
+        future_targets = torch.from_numpy(np.stack([
+            (cumulative_CC_norms <= t).astype(np.float32)
             for t 
             in self.target_thresholds
         ], axis=1))
 
         return {
             'historical_seq_emb': historical_seq_emb,
-            'historical_seq_float': historical_seq_float,
+            'historical_seq_masked': historical_seq_masked,
             'future_seq_emb': future_seq_emb,
-            'targets': targets
+            'historical_seq': historical_seq,
+            'future_targets': future_targets,
         }
