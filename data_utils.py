@@ -314,6 +314,87 @@ def get_data_splits(data_dir, st_date, end_date, window_len, buffer, p_valid):
     return splits
 
 
+def get_data_splits_s3(bucket_name, subfolder, st_date, end_date, window_len, buffer, p_valid):
+    """Split data files into blocks of training and validation data.
+
+    Purge files in validation split from training split.
+
+    Args:
+        bucket_name (str): Name of s3 bucket
+        subfolder (str): Folder within bucket where pkl files are stored
+        st_date (str): First date in the first validation block
+        end_date (str): Last date in the last validation block
+        window_len (int): Number of calendar dates in each block
+        buffer (int): Number of calendar dates to exclude adjacent (before & after) each block for training data
+        p_valid (float): Percentage of data files to use for validation data
+
+    Returns:
+        splits (list): Sequence of data splits
+
+    """
+    import pickle
+    import boto3
+    
+    # AWS s3 client
+    s3_client = boto3.client('s3')
+    
+    # List files in s3 bucket subfolder
+    files = [
+        f['Key'] 
+        for f 
+        in s3_client.list_objects(Bucket=bucket_name, Prefix=subfolder)['Contents']
+    ]
+
+    # Start and end of each ticker
+    date_spans = []
+    for file in files:
+        response = s3_client.get_object(Bucket=bucket_name, Key=file)
+        if response:
+            body = response['Body']
+            df = pickle.loads(body.read())
+
+            if df.index.name == 'Date':
+                dt_start, dt_end = min(df.index), max(df.index)
+            elif 'Date' in df.columns:
+                dt_start, dt_end = min(df['Date']), max(df['Date'])
+            else:
+                raise ValueError('"Date" not in index or columns')
+
+            date_spans.append([file, dt_start, dt_end])
+
+    date_spans = pd.DataFrame(date_spans)
+    date_spans.columns = ['file', 'start', 'end']
+    
+    # Number of tickers for each validation block
+    n_valid = int(len(date_spans)*p_valid)
+    
+    # Validation dates
+    validation_dates = get_validation_dates(st_date, end_date, window_len, buffer)
+    
+    p = re.compile(r'[^\\\\|\/]{1,100}(?=\.pkl$)')
+    splits = []
+    for block in validation_dates:
+        mask = np.logical_and(
+            date_spans['start'] < block['valid_end'],
+            date_spans['end'] > block['valid_st']
+        )
+        files_valid = list(date_spans.loc[mask,'file'].sample(n=n_valid).values)
+        files_train = list(set(date_spans['file'].values).difference(files_valid))
+        symbols_valid = [p.findall(file)[0] for file in files_valid]
+        symbols_train = [p.findall(file)[0] for file in files_train]
+        splits.append({
+            **block, 
+            **{
+                'files_valid': files_valid,
+                'files_train': files_train,
+                'symbols_valid': symbols_valid,
+                'symbols_train': symbols_train,
+            }
+        })
+        
+    return splits
+
+    
 class FinancialStatementsDataset(Dataset):
     def __init__(
         self, 
