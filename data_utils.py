@@ -394,7 +394,7 @@ def get_data_splits_s3(bucket_name, subfolder, st_date, end_date, window_len, bu
         
     return splits
 
-    
+
 class FinancialStatementsDataset(Dataset):
     def __init__(
         self, 
@@ -860,6 +860,176 @@ class PriceSeriesDataset(Dataset):
         
         return self._get_inputs(df.iloc[st_idx:end_idx].copy(deep=False))
     
+    def _get_rolling_window_idxs(self, df):
+        "Get index tuple [st, end) of rolling windows for a seq of dates"
+        dates = df.index
+        windows = []
+        for idx, dt in enumerate(dates[self.window_len:], self.window_len):
+            if ((self.range_type == 'exclude' and (dt < self.date_A or dt > self.date_B)) or
+                (self.range_type == 'include' and dt >= self.date_A and dt <= self.date_B)):
+                    windows.append((idx - self.window_len, idx))
+
+        return windows
+        
+    def _get_inputs(self, df):
+        "Partition transformed DataFrame into input and target tensors"
+        
+        historical_seq_emb = torch.tensor(df.iloc[:self.n_historical][self.cols_emb].values, dtype=torch.long)
+        future_seq_emb = torch.tensor(df.iloc[self.n_historical:][self.cols_emb].values, dtype=torch.long)
+
+        historical_seq = df.iloc[:self.n_historical][self.cols_float].values
+        mask = norm.cdf(auto_corr_randn(self.n_historical, self.mask_auto_corr, self.rnd)) <= self.p_mask
+        historical_seq_masked = historical_seq.copy()
+        historical_seq_masked[mask] = 0
+        
+        historical_seq = torch.tensor(historical_seq, dtype=torch.float)
+        historical_seq_masked = torch.tensor(historical_seq_masked, dtype=torch.float)
+        
+        cumulative_CC_norms = np.cumsum(df.iloc[self.n_historical:]['CC_norm'].values)/(np.arange(self.n_future) + 1)
+        future_targets = torch.from_numpy(np.stack([
+            (cumulative_CC_norms <= t).astype(np.float32)
+            for t 
+            in self.target_thresholds
+        ], axis=1))
+
+        return {
+            'historical_seq_emb': historical_seq_emb,
+            'historical_seq_masked': historical_seq_masked,
+            'future_seq_emb': future_seq_emb,
+            'historical_seq': historical_seq,
+            'future_targets': future_targets,
+        }
+
+
+class PriceSeriesDatasetS3(Dataset):
+    """Price Series Dataset for use with files in AWS S3 bucket
+
+    Examples:
+        dataset = PriceSeriesDataset(
+            bucket='sagemaker-price-series-20210312',
+            symbols=split['symbols_train'],
+            files=split['files_train'],
+            date_A=split['buffer_st'],
+            date_B=split['buffer_end'],
+            range_type='exclude', 
+            n_historical=280,
+            n_future=10,
+        )
+
+        >> dataset[0]
+        {'historical_seq_emb': tensor([[8,  3, 20,  1], ...]]),
+         'historical_seq_masked': tensor([[ 0.0000,  0.0000,  0.0000,  0.0000,  0.0000], ...]]),
+         'future_seq_emb': tensor([[10,  3,  5, 16], ...]]),
+         'historical_seq': tensor([[ 0.9524,  0.7966,  1.0035,  0.0510,  0.7732], ...]]),
+         'future_targets': tensor([[0., 0., ...]])}
+
+        >> dataset.__getitem__(0, 'AMZN')
+
+
+        from torch.utils.data import DataLoader
+
+        loader = DataLoader(dataset, batch_size=16, shuffle=False)
+        batch = next(iter(loader))
+
+        for batch in loader:
+             ...
+    """
+    import pickle
+    import boto3
+        
+    def __init__(
+        self,
+        bucket_name,
+        symbols,
+        files, 
+        date_A, 
+        date_B, 
+        range_type='exclude', 
+        n_historical=4*256, 
+        n_future=65, 
+        n_targets=51,
+        p_mask=0.2,
+        mask_auto_corr=0.25,
+        seed=1234):
+        """
+        Args:
+            bucket_name (str): Name of s3 bucket
+            symbols (list): List of symbols included in the dataset's split
+            files (list): List of paths to transformed files included in the dataset's split
+            date_A (str): Either `buffer_st` for training split or `valid_st` for validation split
+            date_B (str): Either `buffer_end` for training split or `valid_end` for validation split
+            range_type (str): Either 'exclude' for training split or 'include' for validation split
+            n_historical (int): Number of trading days to use for historical context
+            n_future (int): Number of trading days to predict into the future
+            n_targets (int): Number of CDF slices to predict for each future time step
+            p_mask (float): Percentage of trading days to mask
+            mask_auto_corr (float): 1-period autocorrelation between masking probabilities
+            seed (int): Random state
+        """
+        # AWS s3 client
+        self.s3_client = self.boto3.client('s3')
+        self.bucket_name = bucket_name
+    
+        self.date_A = date_A
+        self.date_B = date_B
+        self.range_type = range_type
+        self.n_historical = n_historical
+        self.n_future = n_future
+        self.window_len = n_historical + n_future
+        self.n_targets = n_targets
+        self.p_mask = p_mask
+        self.mask_auto_corr = mask_auto_corr
+        self.rnd = np.random.RandomState(seed)
+        
+        self.target_thresholds = norm.ppf(np.linspace(0.001, 0.999, n_targets))
+        
+        self.cols_emb = [
+            'month',
+            'dow',
+            'trading_day',
+            'trading_days_left',
+        ]
+        self.cols_float = [
+            'CL_norm',
+            'CC_norm',
+            'CH_norm',
+            'LH_norm',
+            'turnover_norm'
+        ]
+        
+        # Enumerate all windows (tickers x # rolling window for each ticker)
+        self.symbol_windows, self.all_windows = dict(), []
+        for symbol, file in zip(symbols, files):
+            df = self._read_file(file)
+            if df is not None:
+                windows = [
+                    (file, st_idx, end_idx)
+                    for st_idx, end_idx
+                    in self._get_rolling_window_idxs(df)
+                ]
+                self.symbol_windows[symbol] = windows
+                self.all_windows.extend(windows)
+                
+    def __len__(self):
+        return len(self.all_windows)
+                                          
+    def __getitem__(self, idx, symbol=None):
+        "Load transformed DataFrame, slice to window and extact tensors"
+        if symbol:
+            file, st_idx, end_idx = self.symbol_windows[symbol][idx]
+        else:
+            file, st_idx, end_idx = self.all_windows[idx]
+        
+        df = self._read_file(file)
+        
+        return self._get_inputs(df.iloc[st_idx:end_idx].copy(deep=False))
+    
+    def _read_file(self, file):
+        response = self.s3_client.get_object(Bucket=self.bucket_name, Key=file)
+        if response:
+            body = response['Body']
+            return self.pickle.loads(body.read())
+        
     def _get_rolling_window_idxs(self, df):
         "Get index tuple [st, end) of rolling windows for a seq of dates"
         dates = df.index
