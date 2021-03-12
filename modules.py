@@ -193,7 +193,7 @@ class PriceSeriesFeaturizer(nn.Module):
         decoder_layers = [DecoderBlock(n_attn_heads, encoding_dim, encoding_dim, compression_stride, layer_dropout)]*n_layers
         decoder_layers += [
             nn.Sequential(
-                nn.Conv2d(in_channels=64, out_channels=5, kernel_size=(7,1), padding=(7//2,0)),
+                nn.Conv2d(in_channels=encoding_dim, out_channels=5, kernel_size=(7,1), padding=(7//2,0)),
                 nn.LeakyReLU(0.2),
                 nn.BatchNorm2d(num_features=5),
             )
