@@ -49,8 +49,7 @@ watchlistname = 'Russell 1000 Current & Past'
 symbols = norgatedata.watchlist_symbols(watchlistname)
 print(f'# Symbols: {len(symbols):,}')
 
-# +
-for symbol in symbols[100:110]:
+for symbol in symbols:
     prices = norgatedata.price_timeseries(
         symbol,
         stock_price_adjustment_setting = priceadjust,
@@ -59,23 +58,23 @@ for symbol in symbols[100:110]:
         timeseriesformat=timeseriesformat,
     )
 
-#     prices = norgatedata.index_constituent_timeseries(
-#         symbol,
-#         'S&P 500',
-#         padding_setting = padding_setting,
-#         limit = -1,
-#         pandas_dataframe = prices,
-#         timeseriesformat = timeseriesformat,
-#     ).rename({'Index Constituent': 'S&P 500 Constituent'}, axis='columns')
+    prices = norgatedata.index_constituent_timeseries(
+        symbol,
+        'S&P 500',
+        padding_setting = padding_setting,
+        limit = -1,
+        pandas_dataframe = prices,
+        timeseriesformat = timeseriesformat,
+    ).rename({'Index Constituent': 'S&P 500 Constituent'}, axis='columns')
 
-#     prices = norgatedata.index_constituent_timeseries(
-#         symbol,
-#         'NASDAQ 100',
-#         padding_setting = padding_setting,
-#         limit = -1,
-#         pandas_dataframe = prices,
-#         timeseriesformat = timeseriesformat,
-#     ).rename({'Index Constituent': 'NASDAQ 100 Constituent'}, axis='columns')
+    prices = norgatedata.index_constituent_timeseries(
+        symbol,
+        'NASDAQ 100',
+        padding_setting = padding_setting,
+        limit = -1,
+        pandas_dataframe = prices,
+        timeseriesformat = timeseriesformat,
+    ).rename({'Index Constituent': 'NASDAQ 100 Constituent'}, axis='columns')
     
     prices = norgatedata.index_constituent_timeseries(
         symbol,
@@ -86,7 +85,11 @@ for symbol in symbols[100:110]:
         timeseriesformat = timeseriesformat,
     ).rename({'Index Constituent': 'Russell 1000 Constituent'}, axis='columns')
     
+    prices.to_csv(f'../../../Investing Models/Data/R1K member daily prices/{symbol}.csv')
+    
     r1k_mask = prices['Russell 1000 Constituent'] == 1
     prices = prices[r1k_mask]
     if len(prices) > 300:
-        transform_prices(prices).to_pickle(f'../../../Investing Models/Data/Price Transforms/{symbol}.pkl')
+        transform_prices(prices).to_pickle(f'D:/opt/Price Transforms/{symbol}.pkl')
+
+
