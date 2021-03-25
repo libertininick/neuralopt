@@ -4,36 +4,63 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-mse = nn.MSELoss()
+
 bce = nn.BCELoss()
 
-def calculate_loss(model, batch, forcast_wt=2, device='cpu'):
+def calculate_loss(model, batch, recon_wt=1/0.667, path_wt=1/0.831, mag_wt=1/0.517, dists_wt=1/0.455, device='cpu'):
     historical_seq_emb = batch['historical_seq_emb'].to(device)
-    historical_seq_masked= batch['historical_seq_masked'].to(device)
     historical_seq = batch['historical_seq'].to(device)
+    historical_seq_masked= batch['historical_seq_masked'].to(device)
+    recon_loss_mask = batch['loss_mask'].to(device)
+
     future_seq_emb = batch['future_seq_emb'].to(device)
-    future_targets = batch['future_targets'].to(device)
+    future_ret_path = batch['future_ret_path'].to(device)
 
-    yh_reconstruction = model.encode_decode(historical_seq_emb, historical_seq_masked)
-    yh_forecast = model.forecast(historical_seq_emb, historical_seq, future_seq_emb)
+    batch_size, seq_len = future_ret_path.shape
+    future_ret_mag = torch.abs(torch.diff(
+        future_ret_path*torch.arange(seq_len).unsqueeze(0).to(device)**0.5, 
+        dim=1, 
+        prepend=torch.tensor([[0.0]]*batch_size, device=device)
+    ))
+    future_ret_dists = batch['future_ret_dists'].to(device)
 
-    loss_reconstruction = mse(yh_reconstruction, historical_seq)
-    loss_forecast = bce(yh_forecast, future_targets)
-    loss_joint = loss_reconstruction + forcast_wt*loss_forecast
+    # Reconstruction loss
+    yh_recon = model.encode_decode(historical_seq_emb, historical_seq_masked)
+    loss_recon = torch.abs(yh_recon - historical_seq[:, :, :3])
+    loss_recon = torch.sum(loss_recon*recon_loss_mask)/torch.sum(recon_loss_mask)/3
 
-    return loss_reconstruction, loss_forecast, loss_joint
+    # Future return path and distribution losses
+    yh_path, yh_probas = model.forecast(historical_seq_emb, historical_seq, future_seq_emb)
+    yh_mags = torch.abs(torch.diff(
+        yh_path*torch.arange(seq_len).unsqueeze(0).to(device)**0.5, 
+        dim=1, 
+        prepend=torch.tensor([[0.0]]*batch_size, device=device)
+    ))
+    loss_path = torch.mean(torch.mean(torch.abs(yh_path - future_ret_path), dim=1))
+    loss_mag = torch.mean(torch.mean(torch.abs(yh_mags - future_ret_mag), dim=1))
+    loss_dists = bce(yh_probas, future_ret_dists)
+
+    # Scale and combine losses
+    loss = (
+        loss_recon*recon_wt + 
+        loss_path*path_wt + 
+        loss_mag*mag_wt +
+        loss_dists*dists_wt
+    )/4
+
+    return loss_recon.item(), loss_path.item(), loss_mag.item(), loss_dists.item(), loss
 
 
 def train_batch(model, optimizer, batch, device='cpu'):
 
-    loss_reconstruction, loss_forecast, loss_joint = calculate_loss(model, batch, device=device)
+    loss_recon, loss_path, loss_mag, loss_dists, loss = calculate_loss(model, batch, device=device)
 
-    loss_joint.backward()
+    loss.backward()
     optimizer.step()
 
     optimizer.zero_grad()
     
-    return loss_reconstruction.item(), loss_forecast.item(), loss_joint.item()
+    return loss_recon, loss_path, loss_mag, loss_dists, loss.item()
 
 
 def lr_schedule(n_steps, lr_min, lr_max):
