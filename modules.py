@@ -1,10 +1,11 @@
+
 import numpy as np
 import torch
 import torch.nn as nn
 
 
 class AttentionHead(nn.Module):
-    def __init__(self, in_features, out_features, dropout):
+    def __init__(self, in_features, out_features, dropout=0):
         """Applies query, key, value matrix transformations to input features.
         
         Args:
@@ -21,15 +22,9 @@ class AttentionHead(nn.Module):
         self.dropout = nn.Dropout(p=dropout)
         
         # Query, Key, and Value layers
-        self.query_key = nn.Linear(in_features, out_features, bias=False)
+        self.query = nn.Linear(in_features, out_features, bias=False)
+        self.key = nn.Linear(in_features, out_features, bias=False)
         self.value = nn.Linear(in_features, out_features, bias=False)
-
-        # Feed-forward layer
-        self.ffn = nn.Sequential(
-            nn.Linear(out_features, out_features),
-            nn.LeakyReLU(0.2),
-            nn.BatchNorm1d(out_features)
-        )
 
         # Softmax
         self.softmax = nn.Softmax(dim=-1)
@@ -37,7 +32,7 @@ class AttentionHead(nn.Module):
         self._init_wts()
         
     def _init_wts(self):
-        for m in [self.query_key, self.value]:
+        for m in [self.query, self.key, self.value]:
             m.weight.data = nn.init.normal_(m.weight.data, mean=0, std=(1/m.in_features)**0.5)
 
     def get_attention_weights(self, x):
@@ -46,10 +41,11 @@ class AttentionHead(nn.Module):
         x = x.reshape(-1, n_feats)
         
         # Calculate query/key vectors
-        queries_keys = self.query_key(x).view(batch_size, n_obs, self.n_out)
+        queries = self.query(x).view(batch_size, n_obs, self.n_out)
+        keys = self.key(x).view(batch_size, n_obs, self.n_out)
         
         # Calculate attention scores
-        scores = torch.bmm(queries_keys, queries_keys.transpose(1, 2).contiguous())/self.n_out**0.5
+        scores = torch.bmm(queries, keys.transpose(1, 2).contiguous())/self.n_out**0.5
         
         # Calculate softmax of scores 
         weights = self.softmax(scores.view(-1, n_obs)).view(batch_size, n_obs, n_obs)
@@ -72,155 +68,222 @@ class AttentionHead(nn.Module):
         # Avg weighted avg values based on attention weights 
         values = torch.bmm(weights, values)
 
-        # Feed forward
-        output = self.ffn(values.reshape(-1, self.n_out)).reshape(batch_size, n_obs, self.n_out)
-
-        return output
+        return values
 
 
 class EncoderBlock(nn.Module):
-    def __init__(self, n_attn_heads, in_channels, out_channels, stride, dropout):
+    def __init__(
+        self, 
+        n_features, 
+        conv_kernel_size, 
+        n_attention_heads,
+        rnn_kernel_size,
+        negative_slope=0.1,
+        dropout=0):
         super().__init__()
-        
-        attn_dim = in_channels//n_attn_heads
+
+        self.cov_feature_extractor = nn.Sequential(
+            nn.Dropout2d(dropout),
+            nn.Conv2d(
+                in_channels=n_features, 
+                out_channels=n_features, 
+                kernel_size=(conv_kernel_size, 1), 
+                padding=(conv_kernel_size//2, 0)
+            ),
+            nn.LeakyReLU(negative_slope),
+        )
+
+        attn_dim = n_features//n_attention_heads
         self.attention_heads = nn.ModuleList([
-            AttentionHead(in_channels, attn_dim, dropout)
+            nn.Sequential(
+                AttentionHead(n_features, attn_dim, dropout),
+                nn.LeakyReLU(negative_slope),
+                nn.LayerNorm(normalized_shape=attn_dim),
+            )
             for _
-            in range(n_attn_heads)
+            in range(n_attention_heads)
         ])
 
-        self.strided_conv = nn.Sequential(
-            nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=(stride,1), stride=stride),
-            nn.LeakyReLU(0.2),
-            nn.BatchNorm2d(num_features=out_channels),
+        self.rnn_kernel_size = rnn_kernel_size
+        self.rnn = nn.GRU(
+            input_size=n_features, 
+            hidden_size=n_features//2, 
+            num_layers=2, 
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout
         )
-            
+
+        self._init_wts()
+
+    def _init_wts(self):
+        for m in self.cov_feature_extractor:
+            if isinstance(m, nn.Conv2d):
+                m.weight.data = nn.init.kaiming_normal_(m.weight.data, a=0, mode='fan_in', nonlinearity='relu')
+
+        for name, param in self.rnn.named_parameters():
+            if 'weight' in name:
+                param.data = nn.init.normal_(param.data, mean=0, std=0.001) 
+            if 'bias' in name:
+                param.data = nn.init.constant_(param.data, 3)
+    
     def forward(self, x):
         """
         Args:
-            x (tensor): (batch_size, n_channels, seq_len, 1)
+            x (tensor): (batch_size, seq_len, n_features)
+
+        Returns
+            x (tensor): (bath_size, seq_len, n_features)
         """
-        
-        # Attention mixing
-        x = x.squeeze(-1).permute(0,2,1)
-        x = torch.cat([
-            head(x)
-            for head
-            in self.attention_heads
-        ], dim=-1)
-        x = x.permute(0,2,1).unsqueeze(-1)
-        
-        # Strided convolution compression
-        x = self.strided_conv(x)
-        
-        return x
 
-
-class DecoderBlock(nn.Module):
-    def __init__(self, n_attn_heads, in_channels, out_channels, stride, dropout):
-        super().__init__()
+        # Convolutional feature extraction
+        x = x.permute(0, 2, 1).unsqueeze(-1) # Move features to channels dim and add phantom width dim
+        x = self.cov_feature_extractor(x)
+        x = x.squeeze(-1).permute(0, 2, 1)
         
-        self.strided_transpose_conv = nn.Sequential(
-            nn.ConvTranspose2d(in_channels=in_channels, out_channels=out_channels, kernel_size=(stride,1), stride=stride),
-            nn.LeakyReLU(0.2),
-            nn.BatchNorm2d(num_features=out_channels),
+        # Attention mixing + skip connection
+        a = torch.cat([head(x) for head in self.attention_heads], dim=-1)
+        x = x + a
+
+        # RNN pass
+        # h represents the lass hidden state of each of the rnn_kernel windows
+        batch_size, seq_len, n_features = x.shape
+        o, h = self.rnn(x.reshape(-1, self.rnn_kernel_size, n_features))
+        x = x + o.reshape(batch_size, seq_len, n_features)
+        h = h.reshape(
+            self.rnn.num_layers*(self.rnn.bidirectional + 1), # num_layers * num_directions
+            batch_size,                                       # original batch size
+            n_features//2,                                    # hidden size
+            seq_len//self.rnn_kernel_size                     # number of distinct rnn_kernel windows
         )
-        
-        attn_dim = in_channels//n_attn_heads
-        self.attention_heads = nn.ModuleList([
-            AttentionHead(in_channels, attn_dim, dropout)
-            for _
-            in range(n_attn_heads)
-        ])
-            
-    def forward(self, x):
-        """
-        Args:
-            x (tensor): (batch_size, n_channels, seq_len, 1)
-        """
-        
-        # Stided convolution reconstruction
-        x = self.strided_transpose_conv(x)
-        
-        # Attention mixing
-        x = x.squeeze(-1).permute(0,2,1)
-        x = torch.cat([
-            head(x)
-            for head
-            in self.attention_heads
-        ], dim=-1)
-        x = x.permute(0,2,1).unsqueeze(-1)
-        
-        return x
+
+        return x, h
 
 
 class PriceSeriesFeaturizer(nn.Module):
-    """Encodes a daily price series into a fixed length vector
-    """
     def __init__(
         self, 
-        n_historical,
-        n_forecast_targets,
-        encoding_dim,
-        n_attn_heads=4,
-        compression_stride=4, 
-        layer_dropout=0.1, 
-        cross_connect_dropout=0.25):
+        n_features,
+        n_future,
+        n_targets,
+        conv_kernel_size, 
+        n_attention_heads,
+        rnn_kernel_size,
+        n_blocks, 
+        dropout=0):
 
         super().__init__()
-        
+
+        self.n_emb_feats = 6
+        self.n_float_feats = 5
+        self.n_reconstruction_feats = 3
+        self.n_features = n_features
+        self.n_future = n_future
+        self.n_targets = n_targets
+
+
         self.embeddings = nn.ModuleDict({
             'month': nn.Embedding(num_embeddings=12, embedding_dim=2),
             'dow': nn.Embedding(num_embeddings=5, embedding_dim=2),
             'trading_day': nn.Embedding(num_embeddings=23, embedding_dim=1),
-            'trading_days_left': nn.Embedding(num_embeddings=23, embedding_dim=1)
+            'trading_days_left': nn.Embedding(num_embeddings=23, embedding_dim=1),
+            'future_pos_enc': nn.Embedding(num_embeddings=n_future, embedding_dim=n_features)
         })
+
+        ### Historical sequence encoder ###
+        # Upsampling mapper
+        self.in_feature_map_historical = nn.Linear(in_features=self.n_emb_feats + self.n_float_feats, out_features=n_features)
         
-        # Encoder
-        n_layers = int(np.log(n_historical)/np.log(compression_stride))
-        encoder_layers = [
-            nn.Sequential(
-                nn.Conv2d(in_channels=11, out_channels=encoding_dim, kernel_size=(7,1), padding=(7//2,0)),
-                nn.LeakyReLU(0.2),
-                nn.BatchNorm2d(num_features=encoding_dim),
-            )
-        ]
-        encoder_layers += [EncoderBlock(n_attn_heads, encoding_dim, encoding_dim, compression_stride, layer_dropout)]*n_layers
-        self.encoder = nn.ModuleList(encoder_layers)
+        # Encoder blocks
+        self.blocks = nn.ModuleList([
+            EncoderBlock(n_features, conv_kernel_size, n_attention_heads, rnn_kernel_size, dropout=dropout)
+            for _
+            in range(n_blocks)
 
-        # Decoder
-        self.cross_connection_dropout = nn.Dropout2d(cross_connect_dropout)
-        decoder_layers = [DecoderBlock(n_attn_heads, encoding_dim, encoding_dim, compression_stride, layer_dropout)]*n_layers
-        decoder_layers += [
-            nn.Sequential(
-                nn.Conv2d(in_channels=encoding_dim, out_channels=5, kernel_size=(7,1), padding=(7//2,0)),
-                nn.LeakyReLU(0.2),
-                nn.BatchNorm2d(num_features=5),
-            )
-        ]
-        self.decoder = nn.ModuleList(decoder_layers)
+        ])
 
-        # Forecaster
-        self.rnn_1 = nn.GRU(
-            input_size=6, 
-            hidden_size=encoding_dim//2, 
+
+        ### Historical sequence reconstructor ###
+        self.reconstruction_map = nn.Linear(in_features=n_features, out_features=self.n_reconstruction_feats)
+
+
+        ### Future sequence encoder ###
+        # Upsampling mapper
+        self.in_feature_map_future = nn.Linear(in_features=self.n_emb_feats, out_features=n_features)
+
+        # Future position indxes
+        self.pos_idxs = torch.arange(n_future).unsqueeze(0)
+        
+        # Historical, future attention 
+        self.future_query = nn.Linear(n_features, n_features, bias=False)
+        self.softmax = nn.Softmax(dim=-1)
+
+        # Future self attention
+        self.future_attn = nn.Sequential(
+            AttentionHead(n_features, n_features, dropout),
+            nn.LeakyReLU(0.2),
+            nn.LayerNorm(normalized_shape=n_features),
+        )
+
+        # Sequence encoding RNN
+        self.historical_to_hidden_state_mapper = nn.Sequential(
+            nn.Linear(n_features, 2*2*(n_features//2)),  # (num_layers*num_directions, batch, hidden_size)
+            nn.Tanh(),
+        )
+        self.rnn_future = nn.GRU(
+            input_size=n_features, 
+            hidden_size=n_features//2, 
             num_layers=2, 
             batch_first=True,
             bidirectional=True,
-            dropout=layer_dropout
+            dropout=dropout
         )
-        self.rnn_2 = nn.GRU(
-            input_size=encoding_dim, 
-            hidden_size=encoding_dim//2, 
-            num_layers=2, 
-            batch_first=True,
-            bidirectional=True,
-            dropout=layer_dropout
-        )
-        self.target_classifier = nn.Linear(encoding_dim, n_forecast_targets)
 
 
-    def emb_seq(self, x):
+        ### Return path regressor ###
+        self.forecast_regressor = nn.Linear(n_features, 1)
+        
+        
+        ### Return distribution classifier ###
+        self.forecast_classifier = nn.Sequential(
+            nn.Linear(n_features, n_targets),
+            nn.Sigmoid()
+        )
+
+        # Initialize weights
+        self._init_wts()
+
+    def _init_wts(self):
+        for emb in self.embeddings.values():
+            emb.weight.data = nn.init.normal_(emb.weight.data, mean=0, std=0.01)
+
+        for module in [
+            self.in_feature_map_historical,
+            self.reconstruction_map,
+            self.in_feature_map_future,
+            self.future_query,
+            self.historical_to_hidden_state_mapper,
+            self.forecast_regressor,
+            self.forecast_classifier]:
+
+            if isinstance(module, nn.Sequential):
+                for layer in module:
+                    if isinstance(layer, nn.Linear):
+                        layer.weight.data = nn.init.normal_(layer.weight.data, mean=0, std=0.001) 
+                        if layer.bias is not None: 
+                            layer.bias.data = nn.init.constant_(layer.bias.data, 0)
+            elif isinstance(module, nn.Linear):
+                module.weight.data = nn.init.normal_(module.weight.data, mean=0, std=0.001) 
+                if module.bias is not None: 
+                    module.bias.data = nn.init.constant_(module.bias.data, 0)
+
+        for name, param in self.rnn_future.named_parameters():
+            if 'weight' in name:
+                param.data = nn.init.normal_(param.data, mean=0, std=0.001) 
+            if 'bias' in name:
+                param.data = nn.init.constant_(param.data, 3)
+
+    def _emb_seq(self, x):
         """
         Args:
             x (tensor): Embedding sequence (batch_size, seq_len, 4)
@@ -232,62 +295,223 @@ class PriceSeriesFeaturizer(nn.Module):
         ], dim=-1)
         
         return embs
-    
-    def encode(self, x_emb, x_float):
-        x = torch.cat((self.emb_seq(x_emb), x_float), dim=-1)
-        x = x.permute(0,2,1).unsqueeze(-1)
-        
-        for layer in self.encoder:
-            x = layer(x)
 
-        return x.squeeze()
+    def _encode_position(self, batch_size):
+        """
+        Args:
+            batch_size (int)
+        """
+
+        pos_idxs = torch.repeat_interleave(self.pos_idxs, repeats=batch_size, dim=0)
+        return self.embeddings['future_pos_enc'](pos_idxs)
+
+    def _encode(self, x_emb, x_float):
+
+        batch_size, seq_len, _ = x_emb.shape
+
+        # Embed inputs and concat to float inputs
+        x_emb = self._emb_seq(x_emb)
+        x = torch.cat((x_emb, x_float), dim=-1)
+
+        # Map input to n_features
+        x = x.reshape(-1, self.n_emb_feats + self.n_float_feats)
+        x = self.in_feature_map_historical(x)
+        x = x.reshape(batch_size, seq_len, self.n_features)
+
+        # Encode with skip connections
+        for block in self.blocks:
+            o, _ = block(x)
+            x = x + o
+
+        return x
+
+    def _historical_forecast_attention(self, h_feats, f_feats):
+        """Historical attention weights for forecast sequence
+        """
+        batch_size = f_feats.shape[0]
+        
+        # Calculate query vectors
+        f_feats = f_feats.reshape(-1, self.n_features)
+        queries = self.future_query(f_feats)
+        queries = queries.reshape(batch_size, self.n_future, self.n_features)
+        
+        # Calculate attention scores
+        scores = torch.bmm(queries, h_feats.transpose(1, 2).contiguous())/self.n_features**0.5
+        
+        # Calculate softmax of scores 
+        scores = scores.reshape(-1, self.n_future)
+        weights = self.softmax(scores)
+        weights = weights.reshape(batch_size, self.n_future, -1)
+        
+        return weights
 
     def encode_decode(self, x_emb, x_float):
-        x = torch.cat((self.emb_seq(x_emb), x_float), dim=-1)
-        x = x.permute(0,2,1).unsqueeze(-1)
-        
-        layer_states = []
-        for layer in self.encoder:
-            x = layer(x)
-            layer_states.append(x)
-        
-        for layer, state in zip(self.decoder[:-1], layer_states[:-1][::-1]):
-            x = layer(x) + self.cross_connection_dropout(state)
-        x = self.decoder[-1](x)
-        
-        x = x.squeeze(-1).permute(0,2,1)
+
+        batch_size, seq_len, _ = x_emb.shape
+
+        # Encode
+        x = self._encode(x_emb, x_float)
+
+        # Map input to reconstruction features
+        x = x.reshape(-1, self.n_features)
+        x = self.reconstruction_map(x)
+        x = x.reshape(batch_size, seq_len, self.n_reconstruction_feats)
         
         return x
 
-    def get_forecast_context(self, h_emb, h_float, f_emb):
-        """Context embedding for each period in forecast window
-        """
-        # Encode historical price series
-        h_encoding = self.encode(h_emb, h_float)
-        h_encoding = h_encoding.unsqueeze(dim=1)
+    def encode_future_path(self, h_emb, h_float, f_emb):
+
+        # Historical features
+        h_feat = self._encode(h_emb, h_float)
+        batch_size, _, n_features = h_feat.shape
+
+        # Init Future features
+        f_emb = self._emb_seq(f_emb)
+        f_feat = self.in_feature_map_future(f_emb)
+        pos_enc = self._encode_position(f_emb.shape[0])
+        f_feat = f_feat + pos_enc
         
-        # Embed forecast window
-        f_seq = self.emb_seq(f_emb)
-        f_seq, _ = self.rnn_1(f_seq)
+        # Historical, Forecast attention + skip connection
+        weights = self._historical_forecast_attention(h_feat, f_feat)
+        a = torch.bmm(weights, h_feat)
+        f_feat = f_feat + a
 
-        # Add historical encoding to each period
-        f_seq = f_seq + h_encoding
+        # RNN forecast + skip connection
+        # Hidden layers is seeded with the last hidden layer from historical featurization
+        h0 = self.historical_to_hidden_state_mapper(h_feat[:, -1, :])
+        o, _ = self.rnn_future(f_feat, h0.reshape(2*2, batch_size, n_features//2))
+        f_feat = f_feat + o
 
-        # Generate context
-        f_context, _ = self.rnn_2(f_seq)
+        # Self attention + skip connection
+        a = self.future_attn(f_feat + pos_enc)
+        f_feat = f_feat + a
 
-        return f_context
+        return f_feat
 
     def forecast(self, h_emb, h_float, f_emb):
-        """Target predictions for each period in forecast window"""
-        
-        f_context = self.get_forecast_context(h_emb, h_float, f_emb)
+        batch_size = f_emb.shape[0]
 
-        batch_size, seq_len, n_feat = f_context.shape
-        f_context = f_context.reshape(-1, n_feat)
-        f_probas = self.target_classifier(f_context)
-        f_probas = torch.cumsum(f_probas, dim=-1)  # Cumulative probability across target thresholds
-        f_probas = f_probas.reshape(batch_size, seq_len, -1)
-        f_probas = torch.sigmoid(f_probas)
+        # Encode future path
+        f_feat = self.encode_future_path(h_emb, h_float, f_emb)
+        f_feat = f_feat.reshape(batch_size*self.n_future, self.n_features)
 
-        return f_probas
+        # Future path CC predictions
+        f_path = self.forecast_regressor(f_feat).reshape(batch_size, self.n_future)
+
+        # Probability predictions
+        f_probas = self.forecast_classifier(f_feat).reshape(batch_size, self.n_future, self.n_targets)
+
+        return f_path, f_probas
+
+
+class AdaptiveInstanceNormalization(nn.Module):
+    def __init__(self, seq_len, n_features):
+        super().__init__()
+
+        self.scale_mapper = nn.Sequential(
+            nn.Linear(n_features, n_features//2),
+            nn.ReLU(),
+            nn.Linear(n_features//2, seq_len)
+        )
+
+        self.bias_mapper = nn.Sequential(
+            nn.Linear(n_features, n_features//2),
+            nn.ReLU(),
+            nn.Linear(n_features//2, seq_len)
+        )
+
+    def forward(self, x, noise):
+        """
+        context (tensor): (batch_size, seq_len, n_features)
+        noise (tensor): (batch_size, n_features)
+        """
+
+        scale = self.scale_mapper(noise).unsqueeze(-1)
+        bias = self.bias_mapper(noise).unsqueeze(-1)
+
+        mu = torch.mean(x, dim=-1, keepdim=True)
+        std = torch.std(x, dim=-1, keepdim=True)
+
+        x = (x - mu)/std*scale + bias
+
+        return x
+
+
+class PriceSeriesGenerator(nn.Module):
+    """Generative model for simulating a sequency of normalized returns
+    given a historical context
+    """
+    def __init__(self, z_dim, seq_len, n_features, n_out, n_attention_heads, negative_slope=0.1, dropout=0):
+        super().__init__()
+
+        self.noise_mapper = nn.Sequential(
+            nn.Linear(z_dim, 4*n_features),
+            nn.LeakyReLU(negative_slope),
+            nn.Linear(4*n_features, 2*n_features),
+            nn.LeakyReLU(negative_slope),
+            nn.Linear(2*n_features, n_features),
+        )
+
+        self.ada_in_1 = AdaptiveInstanceNormalization(seq_len, n_features)
+        self.ada_in_2 = AdaptiveInstanceNormalization(seq_len, n_features)
+
+        attn_dim = n_features//n_attention_heads
+        self.attention_heads = nn.ModuleList([
+            nn.Sequential(
+                AttentionHead(n_features, attn_dim, dropout),
+                nn.LeakyReLU(negative_slope),
+                nn.LayerNorm(normalized_shape=attn_dim),
+            )
+            for _
+            in range(n_attention_heads)
+        ])
+
+        self.noise_to_hidden_state_mapper = nn.Sequential(
+            nn.Linear(n_features, 2*2*(n_features//2)),  # (num_layers*num_directions, batch, hidden_size)
+            nn.Tanh(),
+        )
+        self.rnn = nn.GRU(
+            input_size=n_features, 
+            hidden_size=n_features//2, 
+            num_layers=2, 
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout
+        )
+
+        self.output_mapper = nn.Linear(n_features, n_out)
+
+    def forward(self, context, noise):
+        """
+
+        Args:
+            context (tensor): (batch_size, seq_len, n_features)
+            noise (tensor): (batch_size, z_dim)
+        """
+        batch_size, seq_len, n_features = context.shape
+
+        # Map noise and add to context
+        noise = self.noise_mapper(noise)
+        x = context + noise.unsqueeze(1)
+
+        # Self attention + skip connection
+        a = torch.cat([head(x) for head in self.attention_heads], dim=-1)
+        x = x + a
+
+        # Adaptive instance normalization
+        x = self.ada_in_1(x, noise)
+
+        # RNN pass
+        h0 = self.noise_to_hidden_state_mapper(noise).reshape(2*2, batch_size, n_features//2)
+        o, _ = self.rnn(x, h0)
+        x = x + o
+
+        # Adaptive instance normalization
+        x = self.ada_in_2(x, noise)
+
+        # Map to output
+        x = x.reshape(batch_size*seq_len, n_features)
+        x = self.output_mapper(x)
+        x = x.reshape(batch_size, seq_len, -1)
+
+        return x
