@@ -1,7 +1,7 @@
 beautifulsoup4
 matplotlib
 norgatedata
-numpy==1.19.3
+numpy
 pandas
 requests
 scipy
