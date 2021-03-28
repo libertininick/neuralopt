@@ -621,7 +621,7 @@ class PriceSeriesDataset(Dataset):
         date_B=None, 
         n_historical=4*256, 
         n_future=65, 
-        n_targets=51,
+        n_dist_targets=13,
         p_mask=0.2,
         seed=1234):
         """
@@ -638,7 +638,7 @@ class PriceSeriesDataset(Dataset):
 
             n_historical (int): Number of trading days to use for historical context
             n_future (int): Number of trading days to predict into the future
-            n_targets (int): Number of CDF slices to predict for each future time step
+            n_dist_targets (int): Number of CDF slices to predict for each future time step
             p_mask (float): Percentage of trading days to mask
             mask_auto_corr (float): 1-period autocorrelation between masking probabilities
             seed (int): Random state
@@ -654,11 +654,11 @@ class PriceSeriesDataset(Dataset):
         self.n_historical = n_historical
         self.n_future = n_future
         self.window_len = n_historical + n_future
-        self.n_targets = n_targets
+        self.n_dist_targets = n_dist_targets
         self.p_mask = p_mask
         self.rnd = np.random.RandomState(seed)
         
-        self.target_thresholds = norm.ppf(np.linspace(0.001, 0.999, n_targets))
+        self.target_thresholds = norm.ppf(np.linspace(0.001, 0.999, n_dist_targets))
         
         self.cols_emb = [
             'month',
@@ -666,7 +666,7 @@ class PriceSeriesDataset(Dataset):
             'trading_day',
             'trading_days_left',
         ]
-        self.cols_float = [
+        self.cols_LCHVT = [
             'CL_norm',
             'CC_norm',
             'CH_norm',
@@ -726,41 +726,47 @@ class PriceSeriesDataset(Dataset):
     def _get_inputs(self, df):
         "Partition transformed DataFrame into input and target tensors"
         
+        # Historical seq embedding columns
         historical_seq_emb = torch.tensor(df.iloc[:self.n_historical][self.cols_emb].values, dtype=torch.long)
+
+        # Historical sequence low, close, high normalized returns, vol and turnover
+        historical_seq_LCHVT = df.iloc[:self.n_historical][self.cols_LCHVT].values
+        
+        # Masked historical sequence low, close, high normalized returns, vol and turnover
+        rand_seq = self.rnd.rand(self.n_historical)
+        mask = rand_seq <= self.p_mask
+        historical_seq_LCHVT_masked = historical_seq_LCHVT.copy()
+        historical_seq_LCHVT_masked[mask] = 0
+        
+        historical_seq_LCHVT = torch.tensor(historical_seq_LCHVT, dtype=torch.float)
+        historical_seq_LCHVT_masked = torch.tensor(historical_seq_LCHVT_masked, dtype=torch.float)
+
+        # Reconstruction loss mask - includes all masked time periods plus an additional 25%*p_mask of non masked periods
+        recon_loss_mask = torch.tensor(rand_seq <= 1.25*self.p_mask, dtype=torch.float).unsqueeze(-1)
+        
+        # Future sequence embedding columns
         future_seq_emb = torch.tensor(df.iloc[self.n_historical:][self.cols_emb].values, dtype=torch.long)
-
-        historical_seq = df.iloc[:self.n_historical][self.cols_float].values
-        mask = self.rnd.rand(len(historical_seq)) <= self.p_mask
-        historical_seq_masked = historical_seq.copy()
-        historical_seq_masked[mask] = 0
         
-        historical_seq = torch.tensor(historical_seq, dtype=torch.float)
-        historical_seq_masked = torch.tensor(historical_seq_masked, dtype=torch.float)
+        # Future sequence low, close, high normalized returns
+        future_seq_LCH = torch.from_numpy(
+            df.iloc[self.n_historical:][self.cols_LCHVT[:3]].values
+        ).to(torch.float)
 
-        # Create loss mask - includes all masked time periods plus an additional ~15%*p_mask of non masked periods
-        loss_mask = np.logical_or(mask, self.rnd.rand(len(historical_seq)) <= 0.15*self.p_mask)
-        loss_mask = torch.tensor(loss_mask, dtype=torch.float).unsqueeze(-1)
-        
-        cumulative_CC_norms = np.cumsum(df.iloc[self.n_historical:]['CC_norm'].values)
+        # Future cumulative return distributions
+        cumulative_CC_norms = np.cumsum(df.iloc[self.n_historical:][self.cols_LCHVT[1]].values)
         cumulative_CC_norms /= np.sqrt(np.arange(self.n_future) + 1)
-        future_ret_path = torch.from_numpy(cumulative_CC_norms).to(torch.float)
         future_ret_dists = torch.from_numpy(np.stack([
             (cumulative_CC_norms <= t).astype(np.float32)
             for t 
             in self.target_thresholds
         ], axis=1))
-        future_LCH = torch.from_numpy(
-            df.iloc[self.n_historical:][['CL_norm', 'CC_norm', 'CH_norm']].values
-        ).to(torch.float)
-        
 
         return {
             'historical_seq_emb': historical_seq_emb,
-            'historical_seq': historical_seq,
-            'historical_seq_masked': historical_seq_masked,
-            'loss_mask': loss_mask,
+            'historical_seq_LCHVT': historical_seq_LCHVT,
+            'historical_seq_LCHVT_masked': historical_seq_LCHVT_masked,
+            'recon_loss_mask': recon_loss_mask,
             'future_seq_emb': future_seq_emb,
-            'future_ret_path': future_ret_path,
+            'future_seq_LCH': future_seq_LCH,
             'future_ret_dists': future_ret_dists,
-            'future_LCH': future_LCH,
         }
