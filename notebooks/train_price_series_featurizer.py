@@ -258,6 +258,8 @@ losses = {
     'total': [],
 }
 
+model.train()
+
 st = time.time()
 for e in range(5):
     loader = DataLoader(datasets['train'], batch_size=batch_size, shuffle=True)
@@ -279,14 +281,43 @@ for e in range(5):
 
 
 # -
-
-
-
-
-
 torch.save(model.state_dict(), 'price_series_featurizer_wts.pth')
 
 # # Eval
+
+# ## Validation losses
+
+# +
+batch_size = 16
+
+valid_losses = {
+    'recon': [],
+    'LCH': [],
+    'mag': [],
+    'dists': [],
+}
+
+model.eval()
+
+st = time.time()
+for e in range(5):
+    for i, batch in enumerate(DataLoader(datasets['valid'], batch_size=batch_size, shuffle=False)):
+        
+        with torch.no_grad():
+            losses_i = calculate_loss(model, batch)
+            
+        for ll, l_i in zip(valid_losses.values(), losses_i):
+            ll.append(l_i)
+            
+print(
+    (np.quantile(valid_losses['recon'], q=[0.25,0.5,0.75])/baseline_losses['recon']).round(3),
+    (np.quantile(valid_losses['LCH'], q=[0.25,0.5,0.75])/baseline_losses['LCH']).round(3),
+    (np.quantile(valid_losses['mag'], q=[0.25,0.5,0.75])/baseline_losses['mag']).round(3),
+    (np.quantile(valid_losses['dists'], q=[0.25,0.5,0.75])/baseline_losses['dists']).round(3),
+)
+# -
+
+# ## Historical weights viewer
 
 # +
 with torch.no_grad():
@@ -294,6 +325,9 @@ with torch.no_grad():
     
 fig, ax = plt.subplots(figsize=(7,15))
 _  = ax.imshow(wts)
+# -
+
+# ## Eval training batch
 
 # +
 batch = next(iter(DataLoader(datasets['train'], batch_size=128, shuffle=True)))
@@ -312,49 +346,50 @@ with torch.no_grad():
 # -
 
 
+# ## Historical recon viewer
+
 fig, axs = plt.subplots(ncols=3, figsize=(5,15))
 _ = axs[0].imshow(batch['historical_seq_LCHVT'][0, :40, :3], cmap='RdBu', vmin=-3, vmax=3)
 _ = axs[1].imshow(batch['historical_seq_LCHVT_masked'][0, :40, :3], cmap='RdBu', vmin=-3, vmax=3)
 _ = axs[2].imshow(x_recon[0][:40], cmap='RdBu', vmin=-3, vmax=3)
 
+# ## Future path plotter
+
 # +
-fig, ax = plt.subplots(figsize=(15,5))
+fig, ax = plt.subplots(figsize=(15,10))
 _ = ax.plot(baseline_path, '-o', color='red')
 
-for i in range(len(batch)):
-    _ = ax.plot(np.append([0], np.cumsum(f_LCH[i,:,1].numpy())), '-o', color='black', alpha=1/len(batch))
+for i in range(len(f_LCH)):
+    _ = ax.plot(np.append([0], np.cumsum(f_LCH[i,:,1].numpy())), '-', color='black', alpha=0.05)
     
 
 
 # +
+fig, ax = plt.subplots(figsize=(12,12))
 
-fig, ax = plt.subplots(figsize=(15,5))
-# _ = ax.plot(baseline_path, '-o', color='red')
+_ = ax.imshow(np.corrcoef(f_LCH[:,:,1]), cmap='RdBu', vmin=-1, vmax=1)
 
-for i in range(len(batch)):
-    _ = ax.plot(paths[i], '-o', color='black', alpha=1/len(batch))
-    
 # -
 
-t = 1
-print(baseline_dists[t].numpy())
-print()
-print(torch.mean(probas, dim=0)[t].numpy())
+# ## Future dist plotter
 
-path_idx = 10
-fig, ax = plt.subplots(figsize=(15,5))
-_ = ax.plot(batch['future_ret_path'][path_idx], '-o', color='black')
-_ = ax.plot(paths[path_idx], '-o', color='orange')
-_ = ax.plot(baseline_path, '-o', color='gray')
+# ### Day 1
 
-with torch.no_grad():
+fig, ax = plt.subplots(figsize=(15,7))
+for i in range(len(f_ret_probas)):
+    _ = ax.plot(f_ret_probas[i,0,:].numpy(), '-o', color='black', alpha=0.05)
 
+# ### Day 10
 
+fig, ax = plt.subplots(figsize=(15,7))
+for i in range(len(f_ret_probas)):
+    _ = ax.plot(f_ret_probas[i,9,:].numpy(), '-o', color='black', alpha=0.05)
 
+# ### Day 65
 
-x = torch.randn(8,10,5)
-m = nn.LayerNorm(normalized_shape=5)
-m(x).shape
+fig, ax = plt.subplots(figsize=(15,7))
+for i in range(len(f_ret_probas)):
+    _ = ax.plot(f_ret_probas[i,-1,:].numpy(), '-o', color='black', alpha=0.05)
 
 # # Generation
 
