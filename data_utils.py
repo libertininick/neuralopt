@@ -14,6 +14,52 @@ import torch
 from torch.utils.data import Dataset
 
 
+def calc_earnings_markers(trading_dates, earnings_dates):
+    """Aligns `trading_dates` with `earnings_dates`
+    
+    'On'     : Earnings released on that date
+    'Before' : Last trading date immediately before earnings released date
+    'After'  : First trading date immediately after earnings released date
+    'Non'    : Non-earnings date
+    'Unk'    : No earnings data
+    
+    Args:
+        trading_dates (ndarray): Sequence of trading dates
+        earnings_dates (ndarray): Earnings release dates
+        
+    Returns:
+        earnings_markers (ndarray)
+    """
+    earnings_markers = np.array(['Unk']*len(trading_dates), dtype=object)
+    
+    if len(earnings_dates) > 0:
+        # Fill earnings data bounds with "Non"
+        min_date, max_date = np.min(earnings_dates), np.max(earnings_dates)
+        earnings_data_mask = np.logical_and(
+            trading_dates >= min_date,
+            trading_dates <= max_date
+        )
+        earnings_markers[earnings_data_mask] = 'Non'
+        
+        # Fill "Before", "On", "After" markers
+        for e_dt in earnings_dates:
+            # Number of days between earnings release date and all trading days
+            n_days = (trading_dates - e_dt)/np.timedelta64(1, 'D')
+
+            # Dates before release date
+            before_idx = np.argmin(np.where(n_days < 0, np.abs(n_days), np.inf))
+            earnings_markers[before_idx] = 'Before'
+
+            # Date on release date
+            earnings_markers[n_days == 0] = 'On'
+
+            # Dates after release date
+            after_idx = np.argmin(np.where(n_days > 0, n_days, np.inf))
+            earnings_markers[after_idx] = 'After'
+
+    return earnings_markers
+
+
 def _get_trading_days(date):
     "Enumerate weekdays for the `date` month"
     trading_dates = np.array([
@@ -65,6 +111,16 @@ def transform_prices(df_prices, mean_window=260, std_window=10):
     df_out['dow'] = np.vectorize(dow_mapper.get)(df_out.index.day_name())
     df_out['trading_day'] = df_out.index.map(get_trading_day)
     df_out['trading_days_left'] = df_out.index.map(get_trading_days_left)
+
+    # Earnings markers
+    earnings_marker_mapper = {
+        'Unk': 0,
+        'Non': 1,
+        'Before': 2,
+        'On': 3,
+        'After': 4
+    }
+    df_out['earnings_marker'] = np.vectorize(earnings_marker_mapper.get)(df_out['earnings_marker'])
     
     # Previous close & turnover
     prev_close = df_out['Close'].shift(periods=1)
@@ -109,6 +165,7 @@ def transform_prices(df_prices, mean_window=260, std_window=10):
         'dow',
         'trading_day',
         'trading_days_left',
+        'earnings_marker',
         'CL_norm',
         'CC_norm',
         'CH_norm',
@@ -592,13 +649,13 @@ class PriceSeriesDataset(Dataset):
         )
 
         >> dataset[0]
-        {'historical_seq_emb': tensor([[8,  3, 20,  1], ...]]),
-         'historical_seq': tensor([[ -1.23,  0.42,  -0.123,  1.56,  -0.78], ...]]),
-         'historical_seq_masked': tensor([[ 0.0000,  0.0000,  0.0000,  0.0000,  0.0000], ...]]),
-         'loss_mask': tensor([[1, 0, 1, 1, ..]]),
-         'future_seq_emb': tensor([[10,  3,  5, 16], ...]]),
-         'future_ret_path': tensor([[ 0.9524,  0.7966,  1.0035,  0.0510,  0.7732, ...]]),
-         'future_targets': tensor([[0., 0., ...]])}
+        {'historical_seq_emb': tensor([[8,  3, 20,  1, 0], ...]]),
+         'historical_seq_LCH': tensor([[ -1.23,  0.42,  -0.123], ...]]),
+         'historical_seq_LCH_masked': tensor([[ 0.0000,  0.0000,  0.0000], ...]]),
+         'recon_loss_mask': tensor([[1, 0, 1, 1, ..]]),
+         'future_seq_emb': tensor([[10,  3,  5, 16, 1], ...]]),
+         'future_seq_LCH': tensor([[ 0.9524,  0.7966,  1.0035], ...]),
+         'future_ret_dists': tensor([[0., 0., ...]])}
 
         >> dataset.__getitem__(0, 'AMZN')
 
@@ -665,13 +722,12 @@ class PriceSeriesDataset(Dataset):
             'dow',
             'trading_day',
             'trading_days_left',
+            'earnings_marker'
         ]
-        self.cols_LCHVT = [
+        self.cols_LCH = [
             'CL_norm',
             'CC_norm',
             'CH_norm',
-            'LH_norm',
-            'turnover_norm'
         ]
         
         # Enumerate all windows (tickers x # rolling window for each ticker)
@@ -705,7 +761,7 @@ class PriceSeriesDataset(Dataset):
             response = self.s3_client.get_object(Bucket=self.bucket_name, Key=file)
             if response:
                 body = response['Body']
-                return self.pickle.loads(body.read())
+                return pickle.loads(body.read())
         else:
             return pd.read_pickle(file)
 
@@ -729,17 +785,17 @@ class PriceSeriesDataset(Dataset):
         # Historical seq embedding columns
         historical_seq_emb = torch.tensor(df.iloc[:self.n_historical][self.cols_emb].values, dtype=torch.long)
 
-        # Historical sequence low, close, high normalized returns, vol and turnover
-        historical_seq_LCHVT = df.iloc[:self.n_historical][self.cols_LCHVT].values
+        # Historical sequence low, close, high normalized returns
+        historical_seq_LCH = df.iloc[:self.n_historical][self.cols_LCH].values
         
-        # Masked historical sequence low, close, high normalized returns, vol and turnover
+        # Masked historical sequence low, close, high normalized returns
         rand_seq = self.rnd.rand(self.n_historical)
         mask = rand_seq <= self.p_mask
-        historical_seq_LCHVT_masked = historical_seq_LCHVT.copy()
-        historical_seq_LCHVT_masked[mask] = 0
+        historical_seq_LCH_masked = historical_seq_LCH.copy()
+        historical_seq_LCH_masked[mask] = 0
         
-        historical_seq_LCHVT = torch.tensor(historical_seq_LCHVT, dtype=torch.float)
-        historical_seq_LCHVT_masked = torch.tensor(historical_seq_LCHVT_masked, dtype=torch.float)
+        historical_seq_LCH = torch.tensor(historical_seq_LCH, dtype=torch.float)
+        historical_seq_LCH_masked = torch.tensor(historical_seq_LCH_masked, dtype=torch.float)
 
         # Reconstruction loss mask - includes all masked time periods plus an additional 25%*p_mask of non masked periods
         recon_loss_mask = torch.tensor(rand_seq <= 1.25*self.p_mask, dtype=torch.float).unsqueeze(-1)
@@ -749,11 +805,11 @@ class PriceSeriesDataset(Dataset):
         
         # Future sequence low, close, high normalized returns
         future_seq_LCH = torch.from_numpy(
-            df.iloc[self.n_historical:][self.cols_LCHVT[:3]].values
+            df.iloc[self.n_historical:][self.cols_LCH].values
         ).to(torch.float)
 
         # Future cumulative return distributions
-        cumulative_CC_norms = np.cumsum(df.iloc[self.n_historical:][self.cols_LCHVT[1]].values)
+        cumulative_CC_norms = np.cumsum(df.iloc[self.n_historical:][self.cols_LCH[1]].values)
         cumulative_CC_norms /= np.sqrt(np.arange(self.n_future) + 1)
         future_ret_dists = torch.from_numpy(np.stack([
             (cumulative_CC_norms <= t).astype(np.float32)
@@ -763,8 +819,8 @@ class PriceSeriesDataset(Dataset):
 
         return {
             'historical_seq_emb': historical_seq_emb,
-            'historical_seq_LCHVT': historical_seq_LCHVT,
-            'historical_seq_LCHVT_masked': historical_seq_LCHVT_masked,
+            'historical_seq_LCH': historical_seq_LCH,
+            'historical_seq_LCH_masked': historical_seq_LCH_masked,
             'recon_loss_mask': recon_loss_mask,
             'future_seq_emb': future_seq_emb,
             'future_seq_LCH': future_seq_LCH,
