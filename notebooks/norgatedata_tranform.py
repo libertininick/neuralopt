@@ -39,7 +39,7 @@ for part in path_parts[1:]:
     if p not in sys.path:
         sys.path.append(p)
 
-from data_utils import transform_prices
+from data_utils import calc_earnings_markers, transform_prices
 # -
 # # Load, save, and transform data
 
@@ -48,6 +48,10 @@ start_date = '1990-01-01'
 watchlistname = 'Russell 1000 Current & Past'
 symbols = norgatedata.watchlist_symbols(watchlistname)
 print(f'# Symbols: {len(symbols):,}')
+
+earnings_dates = pd.read_csv('../../../Investing Models/Data/Earnings/all_earnings_data.csv')
+earnings_dates['Date'] = pd.to_datetime(earnings_dates['Date'], format='%Y-%m-%d', errors='coerce')
+earnings_dates.shape
 
 for symbol in symbols:
     prices = norgatedata.price_timeseries(
@@ -85,11 +89,42 @@ for symbol in symbols:
         timeseriesformat = timeseriesformat,
     ).rename({'Index Constituent': 'Russell 1000 Constituent'}, axis='columns')
     
+    prices['earnings_marker'] = calc_earnings_markers(
+        trading_dates=prices.index, 
+        earnings_dates=earnings_dates.query('''Symbol == @symbol''').Date
+    )
+    
     prices.to_csv(f'../../../Investing Models/Data/R1K member daily prices/{symbol}.csv')
     
     r1k_mask = prices['Russell 1000 Constituent'] == 1
     prices = prices[r1k_mask]
     if len(prices) > 300:
         transform_prices(prices).to_pickle(f'D:/opt/Price Transforms/{symbol}.pkl')
+
+# ## Add earnings markets from CSV price data
+
+# +
+from glob import glob
+import re
+
+files = glob('../../../Investing Models/Data/R1K member daily prices/*.csv')
+p = re.compile(r'[^\\\\|\/]{1,100}(?=\.csv$)')
+symbols = [p.findall(file)[0] for file in files]
+
+for symbol, file in zip(symbols, files):
+    prices = pd.read_csv(f'../../../Investing Models/Data/R1K member daily prices/{symbol}.csv')
+    prices['Date'] = pd.to_datetime(prices['Date'], format='%Y-%m-%d', errors='coerce')
+    prices = prices.set_index('Date', drop=True)
+    
+    prices['earnings_marker'] = calc_earnings_markers(
+        trading_dates=prices.index, 
+        earnings_dates=earnings_dates.query('''Symbol == @symbol''').Date
+    )
+    
+    r1k_mask = prices['Russell 1000 Constituent'] == 1
+    prices = prices[r1k_mask]
+    if len(prices) > 300:
+        transform_prices(prices).to_pickle(f'D:/opt/Price Transforms/{symbol}.pkl')
+# -
 
 
