@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 
 
-def calculate_feat_loss(model, batch, recon_wt=0.5, seq_order_wt=0.5, LCH_wt=1, dists_wt=1, device='cpu'):
+def calculate_feat_loss(model, batch, device='cpu'):
     h_emb = batch['historical_seq_emb'].to(device)
     h_LCH = batch['historical_seq_LCH'].to(device)
     h_LCH_masked = batch['historical_seq_LCH_masked'].to(device)
@@ -20,31 +20,6 @@ def calculate_feat_loss(model, batch, recon_wt=0.5, seq_order_wt=0.5, LCH_wt=1, 
     loss_recon = torch.abs(yh_recon - h_LCH)
     loss_recon = torch.sum(loss_recon*recon_loss_mask)/torch.sum(recon_loss_mask)/3
 
-    # Sequence order prediction
-    batch_size, h_seq_len = h_LCH.shape[:2]
-    seq_len = 32
-    buffer = np.random.randint(low=0, high=seq_len)
-    st_idx = np.random.randint(low=0, high=h_seq_len - seq_len*2 - buffer)
-    end_idx = st_idx + seq_len*2 + buffer
-    x_emb, x_LCH = h_emb[:,st_idx:end_idx,:], h_LCH[:,st_idx:end_idx,:]
-    if np.random.rand() < 0.5:
-        # Correct ordering
-        x_emb_a, x_LCH_a = x_emb[:,:seq_len,:], x_LCH[:,:seq_len,:]
-        x_emb_b, x_LCH_b = x_emb[:,seq_len + buffer:,:], x_LCH[:,seq_len + buffer:,:]
-
-        order_targets = torch.ones(size=(batch_size,1), dtype=torch.float, device=device)
-    else:
-        # Swapped ordering
-        x_emb_a, x_LCH_a = x_emb[:,seq_len + buffer:,:], x_LCH[:,seq_len + buffer:,:]
-        x_emb_b, x_LCH_b = x_emb[:,:seq_len,:], x_LCH[:,:seq_len,:]
-        order_targets = torch.zeros(size=(batch_size,1), dtype=torch.float, device=device)
-
-    seq_a = model.vectorize_seq(x_emb_a, x_LCH_a)
-    seq_b = model.vectorize_seq(x_emb_b, x_LCH_b)
-    yh_seq_order = model.seq_order_classifier(torch.cat((seq_a, seq_b), dim=-1))
-    loss_seq_order = nn.BCELoss()(yh_seq_order, order_targets)
-
-
     # Future return path and distribution losses
     yh_LCH, yh_ret_probas = model.forecast(h_emb, h_LCH, f_emb)
     loss_LCH = torch.mean(torch.mean(torch.abs(yh_LCH - f_LCH), dim=(1,2)))
@@ -52,25 +27,24 @@ def calculate_feat_loss(model, batch, recon_wt=0.5, seq_order_wt=0.5, LCH_wt=1, 
 
     # Scale and combine losses
     loss = (
-        loss_recon*recon_wt + 
-        loss_seq_order*seq_order_wt +
-        loss_LCH*LCH_wt + 
-        loss_dists*dists_wt
+        loss_recon*0.5 + 
+        loss_LCH + 
+        loss_dists
     )
 
-    return loss_recon.item(), loss_seq_order.item(), loss_LCH.item(), loss_dists.item(), loss
+    return loss_recon.item(), loss_LCH.item(), loss_dists.item(), loss
 
 
 def train_feat_batch(model, optimizer, batch, device='cpu'):
 
-    loss_recon, loss_seq_order, loss_path, loss_dists, loss = calculate_feat_loss(model, batch, device=device)
+    loss_recon, loss_LCH, loss_dists, loss = calculate_feat_loss(model, batch, device=device)
 
     loss.backward()
     optimizer.step()
 
     optimizer.zero_grad()
     
-    return loss_recon, loss_seq_order, loss_path, loss_dists, loss.item()
+    return loss_recon, loss_LCH, loss_dists, loss.item()
 
 
 def _wasserstein_gradients(critic, context, real, fake, epsilon):
