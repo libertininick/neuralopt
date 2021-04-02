@@ -753,6 +753,9 @@ class PriceSeriesDataset(Dataset):
             file, st_idx, end_idx = self.all_windows[idx]
         
         df = self._read_file(file)
+
+        df['trading_day'] = np.minimum(22, df['trading_day'])
+        df['trading_days_left'] = np.minimum(22, df['trading_days_left'])
         
         return self._get_inputs(df.iloc[st_idx:end_idx].copy(deep=False))
     
