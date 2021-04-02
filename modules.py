@@ -35,11 +35,14 @@ class AttentionHead(nn.Module):
         self.value = nn.Linear(in_features, out_features, bias=False)
 
         # Relative postion artifcats
-        self.rel_pos = torch.cdist(
-            torch.arange(max_seq_len)[:,None].to(torch.float), 
-            torch.arange(max_seq_len)[:,None].to(torch.float), 
-            p=1
-        ).to(torch.long)
+        self.rel_pos = nn.parameter.Parameter(
+            data=torch.cdist(
+                torch.arange(max_seq_len)[:,None].to(torch.float), 
+                torch.arange(max_seq_len)[:,None].to(torch.float), 
+                p=1
+            ).to(torch.long),
+            requires_grad=False,
+        )
         self.rel_pos_emb = nn.Embedding(num_embeddings=max_seq_len, embedding_dim=1)
 
         # Softmax
@@ -243,12 +246,16 @@ class PriceSeriesFeaturizer(nn.Module):
 
         # Historical feature averager
         self.h_feat_averager = nn.parameter.Parameter(
-            data=torch.randn(future_seq_len, historical_seq_len)*0.01
+            data=torch.randn(future_seq_len, historical_seq_len)*0.01,
+            requires_grad=True,
         )
         self.softmax = nn.Softmax(dim=-1)
 
         # Future position indxes
-        self.pos_idxs = torch.arange(future_seq_len).unsqueeze(0)
+        self.pos_idxs = nn.parameter.Parameter(
+            data=torch.arange(future_seq_len).unsqueeze(0),
+            requires_grad=False,
+        )
 
         # Feature sequence encoder
         self.future_seq_encoder = nn.GRU(
