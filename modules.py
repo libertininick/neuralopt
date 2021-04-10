@@ -110,9 +110,20 @@ class EncoderBlock(nn.Module):
         dropout=0):
         super().__init__()
 
+        self.rnn_kernel_size = rnn_kernel_size
+        self.rnn = nn.GRU(
+            input_size=n_features, 
+            hidden_size=n_features//2, 
+            num_layers=2, 
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout
+        )
+
         self.negative_slope = negative_slope
         self.cov_feature_extractor = nn.Sequential(
             nn.Dropout2d(dropout),
+            nn.BatchNorm2d(n_features),
             nn.Conv2d(
                 in_channels=n_features, 
                 out_channels=n_features, 
@@ -132,16 +143,6 @@ class EncoderBlock(nn.Module):
             for _
             in range(n_attention_heads)
         ])
-
-        self.rnn_kernel_size = rnn_kernel_size
-        self.rnn = nn.GRU(
-            input_size=n_features, 
-            hidden_size=n_features//2, 
-            num_layers=2, 
-            batch_first=True,
-            bidirectional=True,
-            dropout=dropout
-        )
 
         self._init_wts()
 
@@ -165,28 +166,21 @@ class EncoderBlock(nn.Module):
             x (tensor): (bath_size, seq_len, n_features)
         """
 
-        # Convolutional feature extraction
+        # RNN pass
+        batch_size, seq_len, n_features = x.shape
+        o, _ = self.rnn(x.reshape(-1, self.rnn_kernel_size, n_features))
+        x = x + o.reshape(batch_size, seq_len, n_features)
+
+        # Convolutional smoothing across rnn kernels
         x = x.permute(0, 2, 1).unsqueeze(-1) # Move features to channels dim and add phantom width dim
-        x = self.cov_feature_extractor(x)
+        x = x + self.cov_feature_extractor(x)
         x = x.squeeze(-1).permute(0, 2, 1)
         
         # Attention mixing + skip connection
         a = torch.cat([head(x) for head in self.attention_heads], dim=-1)
         x = x + a
 
-        # RNN pass
-        # h represents the lass hidden state of each of the rnn_kernel windows
-        batch_size, seq_len, n_features = x.shape
-        o, h = self.rnn(x.reshape(-1, self.rnn_kernel_size, n_features))
-        x = x + o.reshape(batch_size, seq_len, n_features)
-        h = h.reshape(
-            self.rnn.num_layers*(self.rnn.bidirectional + 1), # num_layers * num_directions
-            batch_size,                                       # original batch size
-            n_features//2,                                    # hidden size
-            seq_len//self.rnn_kernel_size                     # number of distinct rnn_kernel windows
-        )
-
-        return x, h
+        return x
 
 
 class PriceSeriesFeaturizer(nn.Module):
@@ -244,6 +238,15 @@ class PriceSeriesFeaturizer(nn.Module):
             in range(n_blocks)
         ])
 
+        # Vectorizer
+        self.vectorizer = nn.GRU(
+            input_size=n_features,  
+            hidden_size=n_features//4,  
+            num_layers=2,  
+            batch_first=True, 
+            bidirectional=True, 
+        )
+
         # Historical feature averager
         self.h_feat_averager = nn.parameter.Parameter(
             data=torch.randn(future_seq_len, historical_seq_len)*0.01,
@@ -265,6 +268,11 @@ class PriceSeriesFeaturizer(nn.Module):
             batch_first=True, 
             bidirectional=True, 
         )
+
+        # Layer normalizers
+        self.encoder_norm = nn.LayerNorm(normalized_shape=n_features)
+        self.vectorizer_norm = nn.LayerNorm(normalized_shape=n_features)
+        self.fut_encoder_norm = nn.LayerNorm(normalized_shape=n_features)
 
         # Low, Close, High mapper
         self.LCH_mapper = nn.Linear(in_features=n_features, out_features=self.n_LCH_feats)
@@ -296,11 +304,12 @@ class PriceSeriesFeaturizer(nn.Module):
                 _init_linear(module)
 
 
-        for name, param in self.future_seq_encoder.named_parameters():
-            if 'weight' in name:
-                nn.init.xavier_normal_(param)
-            if 'bias' in name:
-                nn.init.zeros_(param)
+        for rnn in [self.vectorizer, self.future_seq_encoder]:
+            for name, param in rnn.named_parameters():
+                if 'weight' in name:
+                    nn.init.xavier_normal_(param)
+                if 'bias' in name:
+                    nn.init.zeros_(param)
 
     def _emb_seq(self, x):
         """
@@ -341,8 +350,27 @@ class PriceSeriesFeaturizer(nn.Module):
 
         # Encode with skip connections
         for block in self.encoder_blocks:
-            o, _ = block(x)
-            x = x + o
+            x = x + block(x)
+
+        # Normalize to unit hypersphere
+        x = self.encoder_norm(x)
+        x = x/x.norm(p=2, dim=-1, keepdim=True)
+
+        return x
+
+    def vectorize(self, x_emb, x_LCH):
+        # Encode
+        x = self.encode(x_emb, x_LCH)
+
+        # Vectorization
+        x, _ = self.vectorizer(x)
+
+        # Cat first and last outputs
+        x = torch.cat((x[:,0,:], x[:,-1,:]), dim=-1)
+
+        # Normalize to unit hypersphere
+        x = self.vectorizer_norm(x)
+        x = x/x.norm(p=2, dim=-1, keepdim=True)
 
         return x
 
@@ -380,6 +408,10 @@ class PriceSeriesFeaturizer(nn.Module):
 
         # Encode
         f_feat, _ = self.future_seq_encoder(f_feat)
+
+        # Normalize to unit hypersphere
+        f_feat = self.fut_encoder_norm(f_feat)
+        f_feat = f_feat/f_feat.norm(p=2, dim=-1, keepdim=True)
 
         return f_feat
 
