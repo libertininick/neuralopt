@@ -5,6 +5,62 @@ import torch
 import torch.nn as nn
 
 
+def sample_contrastive_pairs(h_emb, h_LCH, h_recon, n_pairs_per=4):
+    """Sample overlapping pairs with sequences 16 - 64 dim long"""
+    seq_len = h_emb.shape[1]
+    
+    size_a = 2**np.random.randint(low=4, high=7)
+    size_b = 2**np.random.randint(low=4, high=7)
+    
+    centers_a = np.random.randint(low=64 + 16, high=seq_len - 64 - 16, size=n_pairs_per)
+    centers_b = centers_a + np.random.randint(low=1, high=33, size=n_pairs_per) - 16
+    
+    lhs_emb, lhs_LCH = [], []
+    for c in centers_a:
+        lhs_emb.append(h_emb[:, c - size_a//2:c + size_a//2, :])
+        lhs_LCH.append(h_LCH[:, c - size_a//2:c + size_a//2, :])
+    lhs_emb = torch.cat(lhs_emb, dim=0)
+    lhs_LCH = torch.cat(lhs_LCH, dim=0)
+        
+    rhs_emb, rhs_LCH = [], []
+    for c in centers_b:
+        rhs_emb.append(h_emb[:, c - size_b//2:c + size_b//2, :])
+        rhs_LCH.append(h_recon[:, c - size_b//2:c + size_b//2, :])
+    rhs_emb = torch.cat(rhs_emb, dim=0)
+    rhs_LCH = torch.cat(rhs_LCH, dim=0)
+    
+    return (lhs_emb, lhs_LCH), (rhs_emb, rhs_LCH)
+
+
+def constrastive_loss(x, y, temp=0.1):
+
+    # Temperature scaled similarity scores
+    sims_xy = torch.exp(torch.matmul(x, y.T)/temp)
+    sims_xx = torch.exp(torch.matmul(x, x.T)/temp)
+    sims_yy = torch.exp(torch.matmul(y, y.T)/temp)
+
+    # Positive pair markers
+    pp_markers = torch.eye(len(x), device=x.device)
+
+    # Positive pair scores
+    pp_scores = torch.sum(sims_xy*pp_markers, dim=-1)
+
+    # Negative samples scores
+    ns_scores = (
+        torch.sum(sims_xy*(1 - pp_markers), dim=-1) +
+        torch.sum(sims_xx*(1 - pp_markers), dim=-1) +
+        torch.sum(sims_yy*(1 - pp_markers), dim=-1)
+    )
+
+    # Positive score to negative samples score ratios
+    ratios = pp_scores/ns_scores
+
+    # normalized temperature-scaled cross entropy loss
+    loss = -torch.log(torch.sum(ratios))
+
+    return loss
+
+
 def calculate_feat_loss(model, batch, device='cpu'):
     h_emb = batch['historical_seq_emb'].to(device)
     h_LCH = batch['historical_seq_LCH'].to(device)
@@ -20,6 +76,12 @@ def calculate_feat_loss(model, batch, device='cpu'):
     loss_recon = torch.abs(yh_recon - h_LCH)
     loss_recon = torch.sum(loss_recon*recon_loss_mask)/torch.sum(recon_loss_mask)/3
 
+    # Contrastive loss
+    lhs, rhs = sample_contrastive_pairs(h_emb, h_LCH, yh_recon.detach())
+    v_lhs = model.vectorize(*lhs)
+    v_rhs = model.vectorize(*rhs)
+    loss_contrast = constrastive_loss(v_lhs, v_rhs)
+
     # Future return path and distribution losses
     yh_LCH, yh_ret_probas = model.forecast(h_emb, h_LCH, f_emb)
     loss_LCH = torch.mean(torch.mean(torch.abs(yh_LCH - f_LCH), dim=(1,2)))
@@ -28,23 +90,24 @@ def calculate_feat_loss(model, batch, device='cpu'):
     # Scale and combine losses
     loss = (
         loss_recon*0.5 + 
+        loss_contrast*0.25 +
         loss_LCH + 
         loss_dists
     )
 
-    return loss_recon.item(), loss_LCH.item(), loss_dists.item(), loss
+    return loss_recon.item(), loss_contrast.item(), loss_LCH.item(), loss_dists.item(), loss
 
 
 def train_feat_batch(model, optimizer, batch, device='cpu'):
 
-    loss_recon, loss_LCH, loss_dists, loss = calculate_feat_loss(model, batch, device=device)
+    loss_recon, loss_contrast, loss_LCH, loss_dists, loss = calculate_feat_loss(model, batch, device=device)
 
     loss.backward()
     optimizer.step()
 
     optimizer.zero_grad()
     
-    return loss_recon, loss_LCH, loss_dists, loss.item()
+    return loss_recon, loss_contrast, loss_LCH, loss_dists, loss.item()
 
 
 def _wasserstein_gradients(critic, context, real, fake, epsilon):
