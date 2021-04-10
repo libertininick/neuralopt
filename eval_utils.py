@@ -1,7 +1,12 @@
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+from matplotlib.patches import Circle
 import numpy as np
 from scipy.spatial.distance import cdist
 from sklearn.decomposition import TruncatedSVD
+from sklearn.neighbors import NearestNeighbors
 import torch
+import umap
 
 
 def get_common_discourse_vectors(X, n_components):
@@ -82,6 +87,8 @@ class SequenceVectorizer():
         knn_median = np.median(dists, axis=-1)
         self.knn_median_min = np.min(knn_median)
 
+        return self
+
     def vectorize_seq(self, x_emb, x_LCH):
     
         batch_size, seq_len = x_emb.shape[:2]
@@ -123,3 +130,81 @@ class SequenceVectorizer():
         v = np.concatenate((lhs_avg, rhs_avg), axis=-1)
         
         return v
+
+
+class Manifold():
+    """Used to approximate the manifold of a sample of points from 
+    either a real distribution of examples or a generated distribution of examples.
+    
+    Improved Precision and Recall Metric for Assessing Generative Models 
+    https://arxiv.org/pdf/1904.06991.pdf
+    
+    """
+    def __init__(self, k):
+        self.k = k
+        self.neighborhood = NearestNeighbors(n_neighbors=k)
+        self.ref_points = None
+        self.dists_k, self.neighbor_k = None, None
+        
+    def fit(self, x):
+        """Fit neighborhood distances to reference points
+        """
+        self.ref_points = x
+        self.neighborhood.fit(x)
+        dists, neigbor_idxs = self.neighborhood.kneighbors(x)
+        self.dists_k, self.neighbor_k = dists[:, -1], neigbor_idxs[:, -1]
+        return self
+    
+    def plot_manifold(self, figsize=(10,10)):
+        """Plot approx manifold in 2D
+        """
+        # Plotting style
+        plt.style.use('seaborn-colorblind')
+        mpl.rcParams['axes.grid'] = False
+        mpl.rcParams['axes.spines.top'] = False
+        mpl.rcParams['axes.spines.right'] = False
+        mpl.rcParams['figure.facecolor'] = 'white'
+        mpl.rcParams['axes.facecolor'] = 'white'
+
+        reducer = umap.UMAP(
+            n_components=2,
+            random_state=1234
+        )
+
+        ref_points_2d = reducer.fit_transform(self.ref_points)
+        means, stds = np.mean(ref_points_2d, axis=0), np.std(ref_points_2d, axis=0)
+        ref_points_2d = (ref_points_2d - means[None,:])/stds[None,:]
+        
+        
+        dists_2d, _ = (
+            NearestNeighbors(n_neighbors=self.k)
+            .fit(ref_points_2d)
+            .kneighbors(ref_points_2d)
+        )
+        dists_k_2d = dists_2d[:, -1]
+        
+        fig, ax = plt.subplots(figsize=figsize)
+        _ = ax.scatter(*ref_points_2d.T, marker='.')
+
+        for (x,y), r in zip(ref_points_2d, dists_k_2d):
+            ax.add_patch(Circle((x,y), r, alpha=0.1))
+            
+        return fig, ax
+    
+    def predict(self, x):
+        """Predict if point lies within the manifold
+        
+        Specifically, if the distance of x_i to any point in ref_points
+        is <= the neighborhood distance for the reference point (dists_k_j),
+        then x_i is predicted to lie within the manifold approximated by
+        the reference points.
+        """
+        
+        # Distance of every point in x to every point in ref_points
+        dists_x_to_ref = cdist(x, self.ref_points, metric='euclidean')
+        
+        # Check if any distance falls within a reference point's neighborhood
+        dist_diffs = dists_x_to_ref - self.dists_k[None, :]
+        in_manifold = np.any(dist_diffs <= 0, axis=-1).astype(int)
+        
+        return in_manifold
