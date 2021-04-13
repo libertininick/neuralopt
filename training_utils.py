@@ -5,34 +5,43 @@ import torch
 import torch.nn as nn
 
 
-def sample_contrastive_pairs(h_emb, h_LCH, h_recon, n_pairs_per=4):
+def sample_contrastive_pairs(h_emb, h_LCH, h_recon, n_pairs_per=8):
     """Sample overlapping pairs with sequences 16 - 64 dim long"""
     seq_len = h_emb.shape[1]
     
-    size_a = 2**np.random.randint(low=4, high=7)
-    size_b = 2**np.random.randint(low=4, high=7)
+    size_a, size_b = 32, 32
     
+    # Randomly sample centers for LHS and RHS, so the windows overlap by at least 16 points
     centers_a = np.random.randint(low=64 + 16, high=seq_len - 64 - 16, size=n_pairs_per)
     centers_b = centers_a + np.random.randint(low=1, high=33, size=n_pairs_per) - 16
     
+    # Slice to LHS windows
     lhs_emb, lhs_LCH = [], []
     for c in centers_a:
         lhs_emb.append(h_emb[:, c - size_a//2:c + size_a//2, :])
         lhs_LCH.append(h_LCH[:, c - size_a//2:c + size_a//2, :])
     lhs_emb = torch.cat(lhs_emb, dim=0)
     lhs_LCH = torch.cat(lhs_LCH, dim=0)
-        
+
+    # Slide to RHS windows  
     rhs_emb, rhs_LCH = [], []
     for c in centers_b:
         rhs_emb.append(h_emb[:, c - size_b//2:c + size_b//2, :])
         rhs_LCH.append(h_recon[:, c - size_b//2:c + size_b//2, :])
     rhs_emb = torch.cat(rhs_emb, dim=0)
     rhs_LCH = torch.cat(rhs_LCH, dim=0)
+
+    # Add Gaussian noise
+    lhs_means, lhs_stds = torch.mean(lhs_LCH, dim=1, keepdim=True), torch.std(lhs_LCH, dim=1, keepdim=True)
+    rhs_means, rhs_stds = torch.mean(rhs_LCH, dim=1, keepdim=True), torch.std(rhs_LCH, dim=1, keepdim=True)
+    means, stds = (lhs_means + rhs_means)/2, (lhs_stds + rhs_stds)/2
+    lhs_LCH = lhs_LCH + torch.randn_like(lhs_LCH)*stds + means
+    rhs_LCH = rhs_LCH + torch.randn_like(rhs_LCH)*stds + means
     
     return (lhs_emb, lhs_LCH), (rhs_emb, rhs_LCH)
 
 
-def constrastive_loss(x, y, temp=0.1):
+def constrastive_loss(x, y, temp=0.25):
 
     # Temperature scaled similarity scores
     sims_xy = torch.exp(torch.matmul(x, y.T)/temp)
@@ -90,7 +99,7 @@ def calculate_feat_loss(model, batch, device='cpu'):
     # Scale and combine losses
     loss = (
         loss_recon*0.5 + 
-        loss_contrast*0.25 +
+        loss_contrast*0.025 +
         loss_LCH + 
         loss_dists
     )
