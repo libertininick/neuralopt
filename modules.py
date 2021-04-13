@@ -183,6 +183,89 @@ class EncoderBlock(nn.Module):
         return x
 
 
+class Vectorizer(nn.Module):
+    def __init__(self, n_features, n_common_components, n_reference_pts, out_dim):
+        super().__init__()
+
+        self.common_components = nn.parameter.Parameter(
+            data = torch.randn((n_common_components, n_features))*0.01,
+            requires_grad=True
+        )
+
+        self.reference_points = nn.parameter.Parameter(
+            data = torch.randn((n_reference_pts, n_features))*0.01,
+            requires_grad=True
+        )
+
+        self.softmax = nn.Softmax(dim=1)
+
+        self.projector = nn.Sequential(
+            nn.Linear(n_features*2, n_features),
+            nn.ReLU(),
+            nn.Linear(n_features, out_dim)
+        )
+
+    def _remove_common_components(self, x):
+        batch_size, seq_len, n_features = x.shape
+        x = x.reshape(-1, n_features)
+        adjustment = x.matmul(self.common_components.T).matmul(self.common_components)
+        x = x - adjustment
+        x = x.reshape(batch_size, seq_len, n_features)
+        return x
+
+    def _calc_inv_wts(self, x):
+        batch_size, seq_len, n_features = x.shape
+
+        scores = x.reshape(-1, n_features).matmul(self.reference_points.T)
+        scores = scores.reshape(batch_size, seq_len, -1)
+
+        # Invert scores (further distance = higher weight)
+        scores = -scores
+        
+        # Softmax across seq_len and average across reference points
+        wts = self.softmax(scores)
+        wts = torch.mean(wts, dim=-1, keepdim=True)
+
+        return wts
+
+    def forward(self, x):
+
+        seq_len = x.shape[1]
+
+        # Remove common components
+        x_adj = self._remove_common_components(x)
+
+        # Inverse density weights
+        inv_density_wts = self._calc_inv_wts(x_adj)
+
+        # Positional weights
+        lhs_wts = torch.arange(start=seq_len, end=0, step=-1, dtype=torch.float, device=x.device)
+        lhs_wts = lhs_wts/torch.sum(lhs_wts)
+        rhs_wts = torch.arange(start=1, end=seq_len + 1, dtype=torch.float, device=x.device)
+        rhs_wts = rhs_wts/torch.sum(rhs_wts)
+        
+        # Combined weights
+        lhs_wts = inv_density_wts*lhs_wts[None,:,None]
+        lhs_wts = lhs_wts/torch.sum(lhs_wts, dim=1, keepdims=True)
+        rhs_wts = inv_density_wts*rhs_wts[None,:,None]
+        rhs_wts = rhs_wts/torch.sum(rhs_wts, dim=1, keepdims=True)
+        
+        # Weighted averages
+        lhs_avg = torch.bmm(x_adj.permute(0,2,1), lhs_wts).squeeze()
+        rhs_avg = torch.bmm(x_adj.permute(0,2,1), rhs_wts).squeeze()
+        
+        # Concat lhs and rhs
+        v = torch.cat((lhs_avg, rhs_avg), dim=-1)
+
+        # Project
+        v = self.projector(v)
+
+        # Normalize to unit hypersphere
+        v = v/v.norm(p=2, dim=-1, keepdim=True)
+
+        return v
+
+
 class PriceSeriesFeaturizer(nn.Module):
     def __init__(
         self, 
@@ -239,12 +322,11 @@ class PriceSeriesFeaturizer(nn.Module):
         ])
 
         # Vectorizer
-        self.vectorizer = nn.GRU(
-            input_size=n_features,  
-            hidden_size=n_features//4,  
-            num_layers=2,  
-            batch_first=True, 
-            bidirectional=True, 
+        self.vectorizer = Vectorizer(
+            n_features=n_features, 
+            n_common_components=3, 
+            n_reference_pts=100,
+            out_dim=3
         )
 
         # Historical feature averager
@@ -269,9 +351,11 @@ class PriceSeriesFeaturizer(nn.Module):
             bidirectional=True, 
         )
 
+        # Future self attention
+        self.future_attn_head = AttentionHead(n_features, n_features, future_seq_len, dropout)
+
         # Layer normalizers
         self.encoder_norm = nn.LayerNorm(normalized_shape=n_features)
-        self.vectorizer_norm = nn.LayerNorm(normalized_shape=n_features)
         self.fut_encoder_norm = nn.LayerNorm(normalized_shape=n_features)
 
         # Low, Close, High mapper
@@ -303,13 +387,11 @@ class PriceSeriesFeaturizer(nn.Module):
             elif isinstance(module, nn.Linear):
                 _init_linear(module)
 
-
-        for rnn in [self.vectorizer, self.future_seq_encoder]:
-            for name, param in rnn.named_parameters():
-                if 'weight' in name:
-                    nn.init.xavier_normal_(param)
-                if 'bias' in name:
-                    nn.init.zeros_(param)
+        for name, param in self.future_seq_encoder.named_parameters():
+            if 'weight' in name:
+                nn.init.xavier_normal_(param)
+            if 'bias' in name:
+                nn.init.zeros_(param)
 
     def _emb_seq(self, x):
         """
@@ -363,14 +445,7 @@ class PriceSeriesFeaturizer(nn.Module):
         x = self.encode(x_emb, x_LCH)
 
         # Vectorization
-        x, _ = self.vectorizer(x)
-
-        # Cat first and last outputs
-        x = torch.cat((x[:,0,:], x[:,-1,:]), dim=-1)
-
-        # Normalize to unit hypersphere
-        x = self.vectorizer_norm(x)
-        x = x/x.norm(p=2, dim=-1, keepdim=True)
+        x = self.vectorizer(x)
 
         return x
 
@@ -406,8 +481,11 @@ class PriceSeriesFeaturizer(nn.Module):
         f_pos_enc = self._encode_position(batch_size)
         f_feat = torch.cat([f_emb, f_pos_enc, h_avg], dim=-1)
 
-        # Encode
+        # Sequentially encode
         f_feat, _ = self.future_seq_encoder(f_feat)
+
+        # Self attention
+        f_feat = self.future_attn_head(f_feat)
 
         # Normalize to unit hypersphere
         f_feat = self.fut_encoder_norm(f_feat)
