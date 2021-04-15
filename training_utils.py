@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 
 
-def sample_contrastive_pairs(h_emb, h_LCH, h_recon, n_pairs_per=8):
+def sample_contrastive_pairs(h_emb, h_LCH, h_recon, n_pairs_per):
     """Sample overlapping pairs with sequences 16 - 64 dim long"""
     seq_len = h_emb.shape[1]
     
@@ -41,7 +41,7 @@ def sample_contrastive_pairs(h_emb, h_LCH, h_recon, n_pairs_per=8):
     return (lhs_emb, lhs_LCH), (rhs_emb, rhs_LCH)
 
 
-def constrastive_loss(x, y, temp=0.25):
+def constrastive_loss(x, y, temp=1):
 
     # Temperature scaled similarity scores
     sims_xy = torch.exp(torch.matmul(x, y.T)/temp)
@@ -70,7 +70,7 @@ def constrastive_loss(x, y, temp=0.25):
     return loss
 
 
-def calculate_feat_loss(model, batch, device='cpu'):
+def calculate_feat_loss(model, batch, n_pairs_per=4, device='cpu'):
     h_emb = batch['historical_seq_emb'].to(device)
     h_LCH = batch['historical_seq_LCH'].to(device)
     h_LCH_masked = batch['historical_seq_LCH_masked'].to(device)
@@ -86,7 +86,7 @@ def calculate_feat_loss(model, batch, device='cpu'):
     loss_recon = torch.sum(loss_recon*recon_loss_mask)/torch.sum(recon_loss_mask)/3
 
     # Contrastive loss
-    lhs, rhs = sample_contrastive_pairs(h_emb, h_LCH, yh_recon.detach())
+    lhs, rhs = sample_contrastive_pairs(h_emb, h_LCH, yh_recon.detach(), n_pairs_per)
     v_lhs = model.vectorize(*lhs)
     v_rhs = model.vectorize(*rhs)
     loss_contrast = constrastive_loss(v_lhs, v_rhs)
@@ -104,19 +104,28 @@ def calculate_feat_loss(model, batch, device='cpu'):
         loss_dists
     )
 
-    return loss_recon.item(), loss_contrast.item(), loss_LCH.item(), loss_dists.item(), loss
+    losses = (
+        loss_recon.item(), 
+        loss_contrast.item(), 
+        loss_LCH.item(), 
+        loss_dists.item(), 
+        loss
+    )
+
+    return losses
 
 
 def train_feat_batch(model, optimizer, batch, device='cpu'):
 
-    loss_recon, loss_contrast, loss_LCH, loss_dists, loss = calculate_feat_loss(model, batch, device=device)
+    *component_losses, loss = calculate_feat_loss(model, batch, device=device)
 
     loss.backward()
     optimizer.step()
 
     optimizer.zero_grad()
     
-    return loss_recon, loss_contrast, loss_LCH, loss_dists, loss.item()
+    losses = (*component_losses, loss.item())
+    return losses
 
 
 def _wasserstein_gradients(critic, context, real, fake, epsilon):
