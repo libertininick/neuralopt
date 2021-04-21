@@ -128,6 +128,9 @@ class SequenceVectorizer():
         
         # Concat lhs and rhs to form vector
         v = np.concatenate((lhs_avg, rhs_avg), axis=-1)
+
+        # Normalize
+        v = v/np.linalg.norm(v, 2)
         
         return v
 
@@ -142,7 +145,7 @@ class Manifold():
     """
     def __init__(self, k):
         self.k = k
-        self.neighborhood = NearestNeighbors(n_neighbors=k)
+        self.neighborhood = NearestNeighbors(n_neighbors=k, metric='cosine')
         self.ref_points = None
         self.dists_k, self.neighbor_k = None, None
         
@@ -201,7 +204,7 @@ class Manifold():
         """
         
         # Distance of every point in x to every point in ref_points
-        dists_x_to_ref = cdist(x, self.ref_points, metric='euclidean')
+        dists_x_to_ref = cdist(x, self.ref_points, metric='cosine')
         
         # Check if any distance falls within a reference point's neighborhood
         dist_diffs = dists_x_to_ref - self.dists_k[None, :]
