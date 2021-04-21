@@ -51,9 +51,9 @@ class AttentionHead(nn.Module):
         # Boom feed-forward layer
         self.ffn = nn.Sequential(
             nn.BatchNorm1d(num_features=out_features),
-            nn.Linear(out_features, out_features*4),
+            nn.Linear(out_features, out_features*2),
             nn.ReLU(),
-            nn.Linear(out_features*4, out_features),
+            nn.Linear(out_features*2, out_features),
         )
         
         self._init_wts()
@@ -157,85 +157,6 @@ class EncoderBlock(nn.Module):
         return x
 
 
-class Vectorizer(nn.Module):
-    def __init__(self, n_features, n_common_components, n_reference_pts, out_dim):
-        super().__init__()
-
-        self.common_components = nn.parameter.Parameter(
-            data = torch.randn((n_common_components, n_features))*0.01,
-            requires_grad=True
-        )
-
-        self.reference_points = nn.parameter.Parameter(
-            data = torch.randn((n_reference_pts, n_features))*0.01,
-            requires_grad=True
-        )
-
-        self.softmax = nn.Softmax(dim=1)
-
-        self.projector = nn.Linear(2*n_features, out_dim)
-
-    def _remove_common_components(self, x):
-        batch_size, seq_len, n_features = x.shape
-        x = x.reshape(-1, n_features)
-        adjustment = x.matmul(self.common_components.T).matmul(self.common_components)
-        x = x - adjustment
-        x = x.reshape(batch_size, seq_len, n_features)
-        return x
-
-    def _calc_inv_wts(self, x):
-        batch_size, seq_len, n_features = x.shape
-
-        scores = x.reshape(-1, n_features).matmul(self.reference_points.T)
-        scores = scores.reshape(batch_size, seq_len, -1)
-
-        # Invert scores (further distance = higher weight)
-        scores = -scores
-        
-        # Softmax across seq_len and average across reference points
-        wts = self.softmax(scores)
-        wts = torch.mean(wts, dim=-1, keepdim=True)
-
-        return wts
-
-    def forward(self, x):
-
-        seq_len = x.shape[1]
-
-        # Remove common components
-        x_adj = self._remove_common_components(x)
-
-        # Inverse density weights
-        inv_density_wts = self._calc_inv_wts(x_adj)
-
-        # Positional weights
-        lhs_wts = torch.arange(start=seq_len, end=0, step=-1, dtype=torch.float, device=x.device)
-        lhs_wts = lhs_wts/torch.sum(lhs_wts)
-        rhs_wts = torch.arange(start=1, end=seq_len + 1, dtype=torch.float, device=x.device)
-        rhs_wts = rhs_wts/torch.sum(rhs_wts)
-        
-        # Combined weights
-        lhs_wts = inv_density_wts*lhs_wts[None,:,None]
-        lhs_wts = lhs_wts/torch.sum(lhs_wts, dim=1, keepdims=True)
-        rhs_wts = inv_density_wts*rhs_wts[None,:,None]
-        rhs_wts = rhs_wts/torch.sum(rhs_wts, dim=1, keepdims=True)
-        
-        # Weighted averages
-        lhs_avg = torch.bmm(x_adj.permute(0,2,1), lhs_wts).squeeze()
-        rhs_avg = torch.bmm(x_adj.permute(0,2,1), rhs_wts).squeeze()
-        
-        # Concat lhs and rhs
-        v = torch.cat((lhs_avg, rhs_avg), dim=-1)
-
-        # Project
-        v = self.projector(v)
-
-        # Normalize to unit hypersphere
-        v = v/v.norm(p=2, dim=-1, keepdim=True)
-
-        return v
-
-
 class PriceSeriesFeaturizer(nn.Module):
     def __init__(
         self, 
@@ -271,34 +192,19 @@ class PriceSeriesFeaturizer(nn.Module):
         self.hist_encoder_blocks = nn.ModuleList([
             EncoderBlock(
                 in_features=self.n_emb_feats + self.n_LCH_feats,
-                out_features=n_features//4,
-                max_seq_len=historical_seq_len,
-                rnn_kernel_size=8,
-                dropout=dropout
-            ),
-            EncoderBlock(
-                in_features=n_features//4,
                 out_features=n_features//2,
                 max_seq_len=historical_seq_len,
-                rnn_kernel_size=16,
+                rnn_kernel_size=8,
                 dropout=dropout
             ),
             EncoderBlock(
                 in_features=n_features//2,
                 out_features=n_features,
                 max_seq_len=historical_seq_len,
-                rnn_kernel_size=32,
+                rnn_kernel_size=16,
                 dropout=dropout
             ),
         ])
-
-        # Vectorizer
-        self.vectorizer = Vectorizer(
-            n_features=n_features, 
-            n_common_components=3, 
-            n_reference_pts=100,
-            out_dim=3
-        )
 
         # Historical feature averager
         self.h_feat_averager = nn.parameter.Parameter(
@@ -314,12 +220,12 @@ class PriceSeriesFeaturizer(nn.Module):
         )
 
         # Feature sequence encoder
-        self.future_encoder = EncoderBlock(
-            in_features=self.n_emb_feats + self.pos_emb_dim + n_features,
-            out_features=n_features,
-            max_seq_len=future_seq_len,
-            rnn_kernel_size=future_seq_len,
-            dropout=dropout
+        self.future_encoder = nn.GRU(
+            input_size=self.n_emb_feats + self.pos_emb_dim + n_features, 
+            hidden_size=n_features//2, 
+            num_layers=1, 
+            batch_first=True,
+            bidirectional=True,
         )
 
         # Low, Close, High mapper
@@ -337,17 +243,6 @@ class PriceSeriesFeaturizer(nn.Module):
     def _init_wts(self):
         for emb in self.embeddings.values():
             emb.weight.data = nn.init.normal_(emb.weight.data, mean=0, std=0.01)
-
-        for module in [
-            self.LCH_mapper,
-            self.dists_forecaster]:
-
-            if isinstance(module, nn.Sequential):
-                for layer in module:
-                    if isinstance(layer, nn.Linear):
-                        _init_linear(layer)
-            elif isinstance(module, nn.Linear):
-                _init_linear(module)
 
     def _emb_seq(self, x):
         """
@@ -385,35 +280,11 @@ class PriceSeriesFeaturizer(nn.Module):
 
         return x
 
-    def vectorize(self, x_emb, x_LCH):
-        # Encode
-        x = self.encode(x_emb, x_LCH)
-
-        # Vectorization
-        x = self.vectorizer(x)
-
-        return x
-
-    def encode_decode(self, h_emb, h_LCH):
-
-        batch_size, seq_len, _ = h_emb.shape
-
-        # Encode
-        x = self.encode(h_emb, h_LCH)
-
-        # Map to LCH features
-        x = x.reshape(-1, self.n_features)
-        x = self.LCH_mapper(x)
-        x = x.reshape(batch_size, seq_len, self.n_LCH_feats)
-        
-        return x
-
     def encode_future_path(self, h_emb, h_LCH, f_emb):
 
         # Historical features
-        with torch.no_grad():
-            h_feat = self.encode(h_emb, h_LCH)
-
+        h_feat = self.encode(h_emb, h_LCH)
+        
         # Historical feature averages
         h_avg = torch.tensordot(
             self._avg_wts(), 
@@ -421,33 +292,60 @@ class PriceSeriesFeaturizer(nn.Module):
             dims=([1],[1])
         ).permute(1,0,2)
 
-        # Init future features
+        # Cat future features
         batch_size = f_emb.shape[0]
         f_emb = self._emb_seq(f_emb)
         f_pos_enc = self._encode_position(batch_size)
         x = torch.cat([f_emb, f_pos_enc, h_avg], dim=-1)
 
         # Encode
-        x = self.future_encoder(x)
+        x, _ = self.future_encoder(x)
 
         return x
 
-    def forecast(self, h_emb, h_LCH, f_emb):
-        batch_size = f_emb.shape[0]
-
-        # Encode future path
-        f_feat = self.encode_future_path(h_emb, h_LCH, f_emb)
-
+    def return_distribution_probas(self, f_feat):
+        batch_size = f_feat.shape[0]
+        
         # Reshape
         f_feat = f_feat.reshape(-1, self.n_features)
 
-        # Future LCH seq predictions
+        # Probability predictions
+        f_ret_probas = self.dists_forecaster(f_feat).reshape(batch_size, self.future_seq_len, self.n_dist_targets)
+
+        return f_ret_probas
+
+    def forward(self, h_emb, h_LCH, f_emb):
+        
+        batch_size = h_emb.shape[0]
+        
+        # Encode historical features
+        h_feat = self.encode(h_emb, h_LCH)
+        
+        # Historical feature averages
+        h_avg = torch.tensordot(
+            self._avg_wts(), 
+            h_feat, 
+            dims=([1],[1])
+        ).permute(1,0,2)
+
+        # Encode future features
+        f_emb = self._emb_seq(f_emb)
+        f_pos_enc = self._encode_position(batch_size)
+        f_feat = torch.cat([f_emb, f_pos_enc, h_avg], dim=-1)
+        f_feat, _ = self.future_encoder(f_feat)
+
+        # Reshape
+        h_feat = h_feat.reshape(-1, self.n_features)
+        f_feat = f_feat.reshape(-1, self.n_features)
+
+        # LCH  predictions
+        h_LCH = self.LCH_mapper(h_feat).reshape(batch_size, self.historical_seq_len, self.n_LCH_feats)
         f_LCH = self.LCH_mapper(f_feat).reshape(batch_size, self.future_seq_len, self.n_LCH_feats)
 
         # Probability predictions
         f_ret_probas = self.dists_forecaster(f_feat).reshape(batch_size, self.future_seq_len, self.n_dist_targets)
 
-        return f_LCH, f_ret_probas
+        return h_LCH, f_LCH, f_ret_probas
 
 
 class AdaptiveInstanceNormalization(nn.Module):
@@ -486,57 +384,55 @@ class AdaptiveInstanceNormalization(nn.Module):
 class PriceSeriesGenerator(nn.Module):
     """Generative model for simulating a sequences of normalized returns given a historical context
     """
-    def __init__(self, noise_dim, seq_len, n_features, n_out, n_attention_heads, negative_slope=0.1, dropout=0):
+    def __init__(self, noise_dim, n_features):
         super().__init__()
 
+        self.n_emb_feats = 8
+        self.n_LCH_feats = 3
         self.noise_dim = noise_dim
 
-        self.noise_mapper = nn.Sequential(
-            nn.Linear(noise_dim, 4*n_features),
-            nn.LeakyReLU(negative_slope),
-            nn.Linear(4*n_features, 2*n_features),
-            nn.LeakyReLU(negative_slope),
-            nn.Linear(2*n_features, n_features),
-        )
+        self.embeddings = nn.ModuleDict({
+            'month': nn.Embedding(num_embeddings=12, embedding_dim=2),
+            'dow': nn.Embedding(num_embeddings=5, embedding_dim=2),
+            'trading_day': nn.Embedding(num_embeddings=23, embedding_dim=1),
+            'trading_days_left': nn.Embedding(num_embeddings=23, embedding_dim=1),
+            'earnings_marker': nn.Embedding(num_embeddings=5, embedding_dim=2)
+        })
 
-        self.ada_in_1 = AdaptiveInstanceNormalization(seq_len, n_features)
-        self.ada_in_2 = AdaptiveInstanceNormalization(seq_len, n_features)
-
-        attn_dim = n_features//n_attention_heads
-        self.attention_heads = nn.ModuleList([
-            nn.Sequential(
-                AttentionHead(n_features, attn_dim, dropout),
-                nn.LeakyReLU(negative_slope),
-                nn.LayerNorm(normalized_shape=attn_dim),
-            )
-            for _
-            in range(n_attention_heads)
-        ])
-
-        self.noise_to_hidden_state_mapper = nn.Sequential(
-            nn.Linear(n_features, 2*2*(n_features//2)),  # (num_layers*num_directions, batch, hidden_size)
-            nn.Tanh(),
-        )
         self.rnn = nn.GRU(
-            input_size=n_features, 
+            input_size=n_features + self.n_emb_feats + noise_dim, 
             hidden_size=n_features//2, 
             num_layers=2, 
             batch_first=True,
             bidirectional=True,
-            dropout=dropout
         )
 
-        self.output_mapper = nn.Linear(n_features, n_out)
+        self.output_mapper = nn.Sequential(
+            nn.Linear(n_features, self.n_LCH_feats)
+        )
 
-    def gen_noise(self, batch_size, mean=0, std=1, clip_lhs=-6, clip_rhs=6, random_state=None, device='cpu'):
+    def _emb_seq(self, x):
+        """
+        Args:
+            x (tensor): Embedding sequence (batch_size, seq_len, 5)
+        """
+        embs = torch.cat([
+            self.embeddings[k](x[:,:,i])
+            for i, k 
+            in enumerate(['month', 'dow', 'trading_day', 'trading_days_left', 'earnings_marker'])
+        ], dim=-1)
+        
+        return embs
+
+    def gen_noise(self, batch_size, seq_len, mean=0, std=1, clip_lhs=-6, clip_rhs=6, random_state=None, device='cpu'):
         """Generates random, normally distributed noise vectors with truncation
         """
         a, b = (clip_lhs - mean)/std, (clip_rhs - mean)/std
-        r = truncnorm.rvs(a, b, size=self.noise_dim*batch_size, random_state=random_state)
-        r = r.reshape(batch_size, self.noise_dim)
+        r = truncnorm.rvs(a, b, size=batch_size*seq_len*self.noise_dim, random_state=random_state)
+        r = r.reshape(batch_size, seq_len, self.noise_dim)
         return torch.from_numpy(r).to(torch.float).to(device)
 
-    def forward(self, context, noise):
+    def forward(self, context, x_emb, noise):
         """
 
         Args:
@@ -545,90 +441,106 @@ class PriceSeriesGenerator(nn.Module):
         """
         batch_size, seq_len, n_features = context.shape
 
-        # Map noise and add to context
-        noise = self.noise_mapper(noise)
-        x = context + noise.unsqueeze(1)
-
-        # Self attention + skip connection
-        a = torch.cat([head(x) for head in self.attention_heads], dim=-1)
-        x = x + a
-
-        # Adaptive instance normalization
-        x = self.ada_in_1(x, noise)
+        # Embed inputs and concat to context features
+        x = torch.cat((self._emb_seq(x_emb), context, noise), dim=-1)
 
         # RNN pass
-        h0 = self.noise_to_hidden_state_mapper(noise).reshape(2*2, batch_size, n_features//2)
-        o, _ = self.rnn(x, h0)
-        x = x + o
-
-        # Adaptive instance normalization
-        x = self.ada_in_2(x, noise)
+        x, _ = self.rnn(x)
 
         # Map to output
         x = x.reshape(batch_size*seq_len, n_features)
         x = self.output_mapper(x)
-        x = x.reshape(batch_size, seq_len, -1)
+        x = x.reshape(batch_size, seq_len, self.n_LCH_feats)
 
         return x
+
+    def generate_samples(self, context, x_emb, n_samples):
+        """Generate `n_samples` for each item in a batch
+        
+        Args:
+            context (tensor): Context input (batch_size, seq_len, n_features)
+            x_emb (tensor): Embedding input (batch_size, seq_len, n_emb_feats)
+            n_samples (int): Number of samples to generate for each item in the batch
+            
+        Returns:
+            LCH_samples (tensor): Generated samples (batch_size, n_samples, seq_len, 3)
+        """
+        
+        batch_size, seq_len = x_emb.shape[:2]
+        
+        # Use the same input noise vectors for each item
+        noise = self.gen_noise(n_samples, seq_len)
+        
+        LCH_samples = []
+        for i in range(batch_size):
+            samples_i = self.forward(
+                torch.repeat_interleave(context[i].unsqueeze(0), repeats=n_samples, dim=0),
+                torch.repeat_interleave(x_emb[i].unsqueeze(0), repeats=n_samples, dim=0),
+                noise
+            )
+            LCH_samples.append(samples_i)
+            
+        LCH_samples = torch.stack(LCH_samples, dim=0)
+        
+        return LCH_samples
 
 
 class PriceSeriesCritic(nn.Module):
     """Critic model for distinguishing between real and generated sequences of normalized returns given a historical context
     """
-    def __init__(
-        self, 
-        n_features, 
-        conv_kernel_size, 
-        n_attention_heads,
-        rnn_kernel_size,
-        n_blocks, 
-        dropout=0):
+    def __init__(self, n_features):
         super().__init__()
 
-        # Upsampling mapper
-        self.seq_upsampler = nn.utils.spectral_norm(nn.Linear(in_features=3, out_features=n_features))
-        
-        # Encoder blocks
-        self.blocks = nn.ModuleList([
-            CriticEncoderBlock(n_features*2, conv_kernel_size, n_attention_heads, rnn_kernel_size, dropout=dropout)
-            for _
-            in range(n_blocks)
-        ])
+        self.n_emb_feats = 8
+        self.n_LCH_feats = 3
+
+        self.embeddings = nn.ModuleDict({
+            'month': nn.Embedding(num_embeddings=12, embedding_dim=2),
+            'dow': nn.Embedding(num_embeddings=5, embedding_dim=2),
+            'trading_day': nn.Embedding(num_embeddings=23, embedding_dim=1),
+            'trading_days_left': nn.Embedding(num_embeddings=23, embedding_dim=1),
+            'earnings_marker': nn.Embedding(num_embeddings=5, embedding_dim=2)
+        })
+
+        self.sequence_featurizer = nn.GRU(
+            input_size=n_features + self.n_emb_feats + self.n_LCH_feats, 
+            hidden_size=n_features//2, 
+            num_layers=2, 
+            batch_first=True,
+            bidirectional=True,
+        )
 
         # Critic scorer
-        self.scorer = nn.utils.spectral_norm(nn.Linear(n_features*2, 1))
+        self.scorer = nn.Sequential(
+            nn.Linear(n_features, n_features),
+            nn.LeakyReLU(0.2),
+            nn.Linear(n_features, 1)
+        )
+
+    def _emb_seq(self, x):
+        """
+        Args:
+            x (tensor): Embedding sequence (batch_size, seq_len, 5)
+        """
+        embs = torch.cat([
+            self.embeddings[k](x[:,:,i])
+            for i, k 
+            in enumerate(['month', 'dow', 'trading_day', 'trading_days_left', 'earnings_marker'])
+        ], dim=-1)
         
-        self._init_wts()
+        return embs
 
-    def _init_wts(self):
-
-        for module in [self.seq_upsampler, self.scorer]:
-
-            if isinstance(module, nn.Sequential):
-                for layer in module:
-                    if isinstance(layer, nn.Linear):
-                        _init_linear(layer)
-            elif isinstance(module, nn.Linear):
-                _init_linear(module)
-
-    def forward(self, context, LCH_seq):
+    def forward(self, context, x_emb, x_LCH):
         batch_size, seq_len, n_features = context.shape
         
-        # Upsample low, close, high sequence
-        seq = LCH_seq.reshape(batch_size*seq_len, -1)
-        seq = self.seq_upsampler(seq)
-        seq = seq.reshape(batch_size, seq_len, n_features)
+        # Embed inputs and concat to LCH inputs and context
+        x = torch.cat((self._emb_seq(x_emb), x_LCH, context), dim=-1)
 
-        # Combine context and sequence
-        x = torch.cat((context, seq), dim=-1)
+        # Featurize sequence
+        x, _ = self.sequence_featurizer(x)
 
-        # Encode with skip connections
-        for block in self.blocks:
-            o, _ = block(x)
-            x = x + o
-
-        # Map encodings to critic scores
-        x = x.reshape(-1, n_features*2)
+        # Map to critic scores
+        x = x.reshape(-1, n_features)
         x = self.scorer(x)
         x = x.reshape(batch_size, seq_len)
         

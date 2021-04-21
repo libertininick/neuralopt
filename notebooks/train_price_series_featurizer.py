@@ -52,8 +52,7 @@ mpl.rcParams['axes.facecolor'] = 'white'
 
 from data_utils import get_data_splits, PriceSeriesDataset
 from modules import PriceSeriesFeaturizer
-from training_utils import calculate_feat_loss, train_feat_batch
-from eval_utils import SequenceVectorizer
+from training_utils import feature_learning_loss, train_feat_batch, lr_schedule, set_lr
 # -
 
 # # Data Set
@@ -210,68 +209,96 @@ model = PriceSeriesFeaturizer(
     historical_seq_len=historical_seq_len,
     future_seq_len=future_seq_len,
     n_dist_targets=n_dist_targets,
-    conv_kernel_size=3,
-    n_attention_heads=1,
-    rnn_kernel_size=16,
-    n_blocks=1
 )
-optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
+optimizer = torch.optim.Adam(model.parameters())
 
 # ## Testing
 
-batch = next(iter(DataLoader(datasets['train'], batch_size=1000, shuffle=True)))
-with torch.no_grad():
-    v = model.vectorize(batch['future_seq_emb'], batch['future_seq_LCH']).numpy()
-
-fig, ax = plt.figure(figsize=(15,15)), plt.axes(projection='3d')
-_ = ax.scatter(*v.T, alpha=0.25);
-_ = ax.set_xlim(left=-1.1, right=1.1)
-_ = ax.set_ylim(bottom=-1.1, top=1.1)
-_ = ax.set_zlim(bottom=-1.1, top=1.1)
-
-
-batch = next(iter(DataLoader(datasets['train'], batch_size=16, shuffle=True)))
-calculate_feat_loss(model, batch)
+batch = next(iter(DataLoader(datasets['train'], batch_size=128, shuffle=True)))
+feature_learning_loss(model, batch)
 
 # ## Training Loop
 
 # +
-batch_size = 16
-cycle_len = 50
-
-losses = {
-    'recon': [],
-    'contrast': [],
-    'LCH': [],
-    'dists': [],
-    'total': [],
-}
-
-model.train()
+batch_size = 128
+cycle_len = 100
+lrs = lr_schedule(
+    n_steps=len(datasets['train'])//batch_size + 1, 
+    lr_min=0.00001, 
+    lr_max=0.005
+)
+q = [0.05,0.25,0.5,0.75,0.95]
 
 st = time.time()
-for e in range(1):
-    loader = DataLoader(datasets['train'], batch_size=batch_size, shuffle=True)
-    for i, batch in enumerate(loader):
-        losses_i = train_feat_batch(model, optimizer, batch)
-        for ll, l_i in zip(losses.values(), losses_i):
+best_train_loss, best_valid_loss = np.inf, np.inf
+for e in range(20):
+    
+    # Load data into memory
+    if e%5 == 0:
+        batches_train = [
+            batch 
+            for batch 
+            in DataLoader(datasets['train'], batch_size=batch_size, shuffle=True, num_workers=3)
+        ]
+
+        batches_valid = [
+            batch 
+            for batch 
+            in DataLoader(datasets['valid'], batch_size=batch_size, shuffle=True, num_workers=3)
+        ]
+        print(f'Data loaded {(time.time() - st)/60:>7.2f}m')
+        
+    
+    # Training Loop
+    model.train()
+    train_losses = {'recon': [], 'LCH': [], 'dists': [], 'total': []}
+    np.random.shuffle(batches_train)
+    for b_i, batch in enumerate(batches_train):
+        
+        set_lr(optimizer, lrs[b_i])
+        
+        losses_i = train_feat_batch(model, optimizer, feature_learning_loss, batch)
+        for ll, l_i in zip(train_losses.values(), losses_i):
             ll.append(l_i)
 
-        if (i + 1) % cycle_len == 0:
+        if (b_i + 1) % cycle_len == 0:
             print(
                 e,
-                f'{i + 1:<7}',
+                f'{b_i + 1:>10,}',
                 f'{(time.time() - st)/60:>7.2f}m',
-                np.quantile(losses['recon'][-cycle_len:], q=[0.25,0.5,0.75]).round(3),
-                np.quantile(losses['contrast'][-cycle_len:], q=[0.25,0.5,0.75]).round(3),
-                np.quantile(losses['LCH'][-cycle_len:], q=[0.25,0.5,0.75]).round(3),
-                np.quantile(losses['dists'][-cycle_len:], q=[0.25,0.5,0.75]).round(3),
+                np.quantile(train_losses['recon'][-cycle_len:], q=q).round(3),
+                np.quantile(train_losses['LCH'][-cycle_len:], q=q).round(3),
+                np.quantile(train_losses['dists'][-cycle_len:], q=q).round(3),
             )
+
+    # Validation Loop
+    model.eval()
+    valid_losses = {'recon': [], 'LCH': [], 'dists': [], 'total': []}
+    for b_i, batch in enumerate(batches_valid):
+        with torch.no_grad():
+            *component_losses, total_loss = feature_learning_loss(model, batch)
+        losses_i = (*component_losses, total_loss.item())
+        for ll, l_i in zip(valid_losses.values(), losses_i):
+            ll.append(l_i)
+    print(
+        e,
+        f'Validation',
+        f'{(time.time() - st)/60:>7.2f}m',
+        np.quantile(valid_losses['recon'], q=q).round(3),
+        np.quantile(valid_losses['LCH'], q=q).round(3),
+        np.quantile(valid_losses['dists'], q=q).round(3),
+    )
+    
+    if (np.mean(train_losses['total']) <= best_train_loss 
+        and np.mean(valid_losses['total']) <= best_valid_loss):
+        torch.save(model.state_dict(), '../models/price_series_featurizer_wts.pth')
+        best_train_loss, best_valid_loss = np.mean(train_losses['total']), np.mean(valid_losses['total'])
+        print('*** Model saved')
+    else:
+        print('!!! Model NOT saved')
 
 
 # -
-torch.save(model.state_dict(), '../models/price_series_featurizer_wts.pth')
-
 # # Eval
 
 # +
@@ -280,62 +307,66 @@ model = PriceSeriesFeaturizer(
     historical_seq_len=historical_seq_len,
     future_seq_len=future_seq_len,
     n_dist_targets=n_dist_targets,
-    conv_kernel_size=5,
-    n_attention_heads=2,
-    rnn_kernel_size=32,
-    n_blocks=3
 )
 
 model.load_state_dict(torch.load('../models/price_series_featurizer_wts.pth'))
 
 model.eval()
-
-# +
-batch = next(iter(DataLoader(datasets['train'], batch_size=128, shuffle=True)))
-
-baseline_LCH = torch.mean(batch['future_seq_LCH'][:,:,1], dim=0).numpy()
-baseline_path = np.append([0], np.cumsum(baseline_LCH, axis=-1))
-
-with torch.no_grad():
-    x_recon = model.encode_decode(batch['historical_seq_emb'], batch['historical_seq_LCH_masked'])
-
-    f_LCH, f_ret_probas = model.forecast(
-        batch['historical_seq_emb'], 
-        batch['historical_seq_LCH'],  
-        batch['future_seq_emb']
-    )
-    
 # -
 
+# ## Test losses
+
+# +
+test_losses = {'recon': [], 'LCH': [], 'dists': [], 'total': []}
+for b_i, batch in enumerate(DataLoader(datasets['test'], batch_size=128, shuffle=True, num_workers=3)):
+    with torch.no_grad():
+        *component_losses, total_loss = feature_learning_loss(model, batch)
+    losses_i = (*component_losses, total_loss.item())
+    for ll, l_i in zip(test_losses.values(), losses_i):
+        ll.append(l_i)
+
+q = [0.05,0.25,0.5,0.75,0.95]
+print(
+    np.quantile(test_losses['recon'], q=q).round(3),
+    np.quantile(test_losses['LCH'], q=q).round(3),
+    np.quantile(test_losses['dists'], q=q).round(3),
+)
+# -
 
 # ## Vector scatter
 
 # +
+from eval_utils import SequenceVectorizer, Manifold
+
 batch = next(iter(DataLoader(datasets['train'], batch_size=1000, shuffle=True)))
-with torch.no_grad():
-    v = model.vectorize(batch['future_seq_emb'], batch['future_seq_LCH']).numpy()
-    
-fig, ax = plt.figure(figsize=(15,15)), plt.axes(projection='3d')
-_ = ax.scatter(*v.T, alpha=0.25);
-_ = ax.set_xlim(left=-1.1, right=1.1)
-_ = ax.set_ylim(bottom=-1.1, top=1.1)
-_ = ax.set_zlim(bottom=-1.1, top=1.1)
+
+vectorizer = SequenceVectorizer(
+    enc_func=model.encode, 
+    n_common=2, 
+    n_ref_samples=500, 
+    seed=1234
+).fit(batch['historical_seq_emb'], batch['historical_seq_LCH'])
+
+v = vectorizer.vectorize_seq(batch['future_seq_emb'], batch['future_seq_LCH'])
+
+manifold = Manifold(k=5).fit(v)
+fig, ax = manifold.plot_manifold(figsize=(15,15))
 
 # +
 from scipy.spatial.distance import cdist
 
-idx=7
-print(v[idx])
+idx=3
 dists = cdist(v, v[idx][None,:], metric='cosine').squeeze()
 
 # Similarity hist
 fig, ax = plt.subplots(figsize=(15,5))
 _ = ax.hist(
-    1 - dists, 
+    1 - dists[np.arange(len(dists)) != idx], 
     bins=30, 
     edgecolor='black',
     alpha=0.5
 )
+_ = ax.set_xlim(-1,1)
 
 idxs = np.argsort(dists)
 fig, ax = plt.subplots(figsize=(15,7))
@@ -343,73 +374,6 @@ _ = ax.plot([0]+np.cumsum(batch['future_seq_LCH'][idx,:,1]).tolist(), color='red
 for i in range(1,4):
     _ = ax.plot([0]+np.cumsum(batch['future_seq_LCH'][idxs[i],:,1]).tolist(), color='black', alpha=0.25)
 # -
-
-# ## Validation losses
-
-# +
-batch_size = 16
-
-valid_losses = {
-    'recon': [],
-    'LCH': [],
-    'dists': [],
-}
-
-model.eval()
-
-st = time.time()
-for i, batch in enumerate(DataLoader(datasets['valid'], batch_size=batch_size, shuffle=False)):
-
-    with torch.no_grad():
-        losses_i = calculate_feat_loss(model, batch)
-
-    for ll, l_i in zip(valid_losses.values(), losses_i):
-        ll.append(l_i)
-        
-    if (i + 1)%(len(datasets['valid'])/batch_size//20) == 0:
-        print(f'''{(i + 1)/(len(datasets['valid'])/batch_size):.0%}''', end=' ')
-
-print(
-    np.quantile(valid_losses['recon'], q=[0.05,0.25,0.5,0.75,0.95]).round(3),
-    np.quantile(valid_losses['LCH'], q=[0.05,0.25,0.5,0.75,0.95]).round(3),
-    np.quantile(valid_losses['dists'], q=[0.05,0.25,0.5,0.75,0.95]).round(3),
-)
-
-# +
-batch_size = 16
-
-test_losses = {
-    'recon': [],
-    'LCH': [],
-    'dists': [],
-}
-
-model.eval()
-
-st = time.time()
-for i, batch in enumerate(DataLoader(datasets['test'], batch_size=batch_size, shuffle=False)):
-
-    with torch.no_grad():
-        losses_i = calculate_feat_loss(model, batch)
-
-    for ll, l_i in zip(test_losses.values(), losses_i):
-        ll.append(l_i)
-        
-    if (i + 1)%(len(datasets['test'])/batch_size//20) == 0:
-        print(f'''{(i + 1)/(len(datasets['test'])/batch_size):.0%}''', end=' ')
-
-print(
-    np.quantile(test_losses['recon'], q=[0.05,0.25,0.5,0.75,0.95]).round(3),
-    np.quantile(test_losses['LCH'], q=[0.05,0.25,0.5,0.75,0.95]).round(3),
-    np.quantile(test_losses['dists'], q=[0.05,0.25,0.5,0.75,0.95]).round(3),
-)
-# -
-
-print(
-    np.quantile(test_losses['recon'], q=[0.05,0.25,0.5,0.75,0.95]).round(3),
-    np.quantile(test_losses['LCH'], q=[0.05,0.25,0.5,0.75,0.95]).round(3),
-    np.quantile(test_losses['dists'], q=[0.05,0.25,0.5,0.75,0.95]).round(3),
-)
 
 # ## Historical weights viewer
 
@@ -462,6 +426,22 @@ _ = ax.legend()
 # -
 
 # ## Historical recon viewer
+
+# +
+batch = next(iter(DataLoader(datasets['train'], batch_size=128, shuffle=True)))
+
+baseline_LCH = torch.mean(batch['future_seq_LCH'][:,:,1], dim=0).numpy()
+baseline_path = np.append([0], np.cumsum(baseline_LCH, axis=-1))
+
+with torch.no_grad():
+    x_recon, f_LCH, f_ret_probas = model(
+        batch['historical_seq_emb'], 
+        batch['historical_seq_LCH_masked'],  
+        batch['future_seq_emb']
+    )
+    
+# -
+
 
 fig, axs = plt.subplots(ncols=3, figsize=(5,15))
 _ = axs[0].imshow(batch['historical_seq_LCH'][0, :40, :3], cmap='RdBu', vmin=-3, vmax=3)

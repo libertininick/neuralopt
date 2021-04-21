@@ -1,8 +1,49 @@
 import os
 
+try:
+    import boto3
+except:
+    print('boto3 library unavailable')
 import numpy as np
+from scipy.stats import norm
 import torch
 import torch.nn as nn
+
+def lr_schedule(n_steps, lr_min, lr_max):
+    """Generates a concave learning rate schedule over
+    `n_steps`, starting and ending at `lr_min` and
+    peaking at `lr_max` mid-way.
+    """
+    schedule = np.arange(n_steps)/(n_steps - 1)
+    schedule = np.sin(schedule*np.pi)
+    schedule = lr_min + (lr_max - lr_min)*schedule
+    return schedule
+
+
+def set_lr(optimizer, lr):
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
+
+def save_state_dict_to_s3(model, file_name, bucket_name, subfolder=None):
+    
+    s3_client = boto3.client('s3')
+    
+    # Save state_dict in current working directory
+    torch.save(model.state_dict(), file_name)
+    
+    # Upload to S3
+    if subfolder:
+        object_name = f'{subfolder}/{file_name}'
+    else:
+        object_name = file_name
+        
+    response = s3_client.upload_file(file_name, bucket_name, object_name)
+    
+    # Remove local copy
+    os.remove(file_name)
+    
+    return response
 
 
 def sample_contrastive_pairs(h_emb, h_LCH, h_recon, n_pairs_per):
@@ -70,54 +111,47 @@ def constrastive_loss(x, y, temp=1):
     return loss
 
 
-def calculate_feat_loss(model, batch, n_pairs_per=4, device='cpu'):
+def feature_learning_loss(model, batch, device='cpu'):
     h_emb = batch['historical_seq_emb'].to(device)
     h_LCH = batch['historical_seq_LCH'].to(device)
     h_LCH_masked = batch['historical_seq_LCH_masked'].to(device)
     recon_loss_mask = batch['recon_loss_mask'].to(device)
-
+    
     f_emb = batch['future_seq_emb'].to(device)
     f_LCH = batch['future_seq_LCH'].to(device)
     f_ret_dists = batch['future_ret_dists'].to(device)
 
+    # Forward
+    yh_h_LCH, yh_f_LCH, yh_f_ret_probas = model(h_emb, h_LCH_masked, f_emb)
+
     # Reconstruction loss
-    yh_recon = model.encode_decode(h_emb, h_LCH_masked)
-    loss_recon = torch.abs(yh_recon - h_LCH)
+    loss_recon = torch.abs(yh_h_LCH - h_LCH)
     loss_recon = torch.sum(loss_recon*recon_loss_mask)/torch.sum(recon_loss_mask)/3
 
-    # Contrastive loss
-    lhs, rhs = sample_contrastive_pairs(h_emb, h_LCH, yh_recon.detach(), n_pairs_per)
-    v_lhs = model.vectorize(*lhs)
-    v_rhs = model.vectorize(*rhs)
-    loss_contrast = constrastive_loss(v_lhs, v_rhs)
-
     # Future return path and distribution losses
-    yh_LCH, yh_ret_probas = model.forecast(h_emb, h_LCH, f_emb)
-    loss_LCH = torch.mean(torch.mean(torch.abs(yh_LCH - f_LCH), dim=(1,2)))
-    loss_dists = nn.BCELoss()(yh_ret_probas, f_ret_dists)
+    loss_LCH = torch.mean(torch.mean(torch.abs(yh_f_LCH - f_LCH), dim=(1,2)))
+    loss_dists = nn.BCELoss()(yh_f_ret_probas, f_ret_dists)
 
     # Scale and combine losses
     loss = (
-        loss_recon*0.5 + 
-        loss_contrast*0.025 +
-        loss_LCH + 
+        loss_recon*0.25 + 
+        loss_LCH*1.5 + 
         loss_dists
     )
 
     losses = (
         loss_recon.item(), 
-        loss_contrast.item(), 
-        loss_LCH.item(), 
-        loss_dists.item(), 
+        loss_LCH.item(),
+        loss_dists.item(),
         loss
     )
 
     return losses
 
 
-def train_feat_batch(model, optimizer, batch, device='cpu'):
+def train_feat_batch(model, optimizer, loss_fxn, batch, device='cpu'):
 
-    *component_losses, loss = calculate_feat_loss(model, batch, device=device)
+    *component_losses, loss = loss_fxn(model, batch, device=device)
 
     loss.backward()
     optimizer.step()
@@ -218,6 +252,46 @@ def calculate_critic_loss(critic, context, real, fake, penalty_wt, device='cpu')
     return score_real.item(), score_fake.item(), loss
 
 
+def ret_distribution_loss(LCH_samples, ret_probas):
+    """Measures the mean squared distances between the qth sample 
+    and the target value for that quantile for each period in the 
+    generated sample of sequences.
+    
+    Quantiles are given by the predicted return distribution probabilities
+    
+    Args:
+        LCH_samples (tensor): Generated samples (batch_size, n_samples, seq_len, 3)
+        ret_probas (tensor): Predicted cumulative return distribution (batch_size, seq_len, n_dist_targets)
+    """
+    
+    batch_size, seq_len, n_dist_targets = ret_probas.shape
+    
+    # Target values to compare qth sample values to
+    targets = torch.tensor(
+        norm.ppf(np.linspace(0.001, 0.999, n_dist_targets)),
+        dtype=torch.float32,
+        device=LCH_samples.device
+    )
+    
+    # Cumulative close-to-close norms of samples
+    CC_rets = LCH_samples[:,:,:,1]
+    cumulative_CC_rets = torch.cumsum(CC_rets, dim=-1)
+    vol_normalizers = (torch.arange(seq_len) + 1)**0.5  # Volatility scales with the sqrt of time
+    cumulative_CC_norms = cumulative_CC_rets/vol_normalizers
+    
+    losses = []
+    # Loop over each item in batch
+    for i in range(batch_size):
+        # Loop over each period in sequence
+        for j in range(seq_len):
+            samples_ij = cumulative_CC_norms[i,:,j]
+            q_ij = ret_probas[i,j,:]  # Predicted quantiles ith sample, jth period
+            quantiles_ij = torch.quantile(samples_ij, q=q_ij)  # Quantile values from generated samples
+            losses.append(torch.mean((quantiles_ij - targets)**2))  # Spread between generated values and targets
+
+    return sum(losses)/len(losses)
+
+
 def train_GC_wass_batch(
     models, 
     optimizers, 
@@ -290,7 +364,9 @@ def train_GC_least_square_batch(
     models, 
     optimizers, 
     batch, 
-    critic_repeats=5, 
+    n_critic_repeats=1,
+    n_gen_repeats=1,
+    n_samples=(4,500),
     device='cpu'):
 
     featurizer, generator, critic = models
@@ -301,35 +377,40 @@ def train_GC_least_square_batch(
     h_LCH = batch['historical_seq_LCH'].to(device)
     f_emb = batch['future_seq_emb'].to(device)
     LCH_real = batch['future_seq_LCH'].to(device)
-    batch_size = h_emb.shape[0]
     
 
     ### Get context ###
     with torch.no_grad():
         context = featurizer.encode_future_path(h_emb, h_LCH, f_emb)
+        ret_probas = featurizer.return_distribution_probas(context)  
 
 
     ### Update critic ###
-    critic_losses = []
-    for _ in range(critic_repeats):
+    critic_losses_real, critic_losses_fake = [], []
+    for _ in range(n_critic_repeats):
 
         # Generate fake examples
         with torch.no_grad():
-            noise = generator.gen_noise(batch_size, device=device)
-            LCH_fake = generator(context, noise)
+            noise = generator.gen_noise(*f_emb.shape[:2], device=device)
+            LCH_fake = generator(context, f_emb, noise)
         
         # Calculate scores
-        scores_real = critic(context, LCH_real)
-        scores_fake = critic(context, LCH_fake)
+        scores_real = critic(context, f_emb, LCH_real)
+        scores_fake = critic(context, f_emb, LCH_fake)
 
         # Critic loss
         loss_real = torch.mean(torch.mean((scores_real - 1)**2, dim=-1))
         loss_fake = torch.mean(torch.mean((scores_fake - 0)**2, dim=-1))
-        critic_loss = (loss_real + loss_fake)/2
-        critic_losses.append(critic_loss.item())
+        critic_losses_real.append(loss_real.item())
+        critic_losses_fake.append(loss_fake.item())
+        real_wt = np.exp(np.log(loss_real.item())*10)
+        fake_wt = np.exp(np.log(loss_fake.item())*10)
+        real_wt = real_wt/(real_wt + fake_wt)
+        fake_wt = 1 - real_wt
+        critic_loss = loss_real*real_wt + loss_fake*fake_wt
         
         # Backprop
-        critic_loss.backward(retain_graph=True)
+        critic_loss.backward()
         
         # Update critic's weights
         critic_opt.step()
@@ -337,54 +418,37 @@ def train_GC_least_square_batch(
 
     
     ### Update generator ###
-    noise = generator.gen_noise(batch_size, device=device)
-    LCH_fake = generator(context, noise)
-    scores_fake = critic(context, LCH_fake)
-    gen_loss = torch.mean(torch.mean((scores_fake - 1)**2, dim=-1))
-    
-    # Backprop
-    gen_loss.backward()
+    gen_losses, dist_losses = [], []
+    for _ in range(n_gen_repeats):
 
-    # Update generator's weights
-    gen_opt.step()
-    gen_opt.zero_grad()
+        noise = generator.gen_noise(*f_emb.shape[:2], device=device)
+        LCH_fake = generator(context, f_emb, noise)
+        scores_fake = critic(context, f_emb, LCH_fake)
+        gen_loss = torch.mean(torch.mean((scores_fake - 1)**2, dim=-1))
+        gen_losses.append(gen_loss.item())
 
-    return gen_loss.item()**0.5, np.mean(critic_losses)**0.5
-
-
-def lr_schedule(n_steps, lr_min, lr_max):
-    """Generates a concave learning rate schedule over
-    `n_steps`, starting and ending at `lr_min` and
-    peaking at `lr_max` mid-way.
-    """
-    schedule = np.arange(n_steps)/(n_steps - 1)
-    schedule = np.sin(schedule*np.pi)
-    schedule = lr_min + (lr_max - lr_min)*schedule
-    return schedule
-
-
-def set_lr(optimizer, lr):
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-
-
-def save_state_dict_to_s3(model, file_name, bucket_name, subfolder=None):
-    import boto3
-    
-    s3_client = boto3.client('s3')
-    
-    # Save state_dict in current working directory
-    torch.save(model.state_dict(), file_name)
-    
-    # Upload to S3
-    if subfolder:
-        object_name = f'{subfolder}/{file_name}'
-    else:
-        object_name = file_name
+        # Distribution loss
+        sample_idxs = torch.randint(low=0, high=context.shape[0], size=n_samples[:1])
+        with torch.no_grad():
+            ret_probas = featurizer.return_distribution_probas(context[sample_idxs])  
+        LCH_samples = generator.generate_samples(context[sample_idxs], f_emb[sample_idxs], n_samples[-1])
+        dist_loss = ret_distribution_loss(LCH_samples, ret_probas)
+        dist_losses.append(dist_loss.item())
         
-    response = s3_client.upload_file(file_name, bucket_name, object_name)
+        # Total generator loss
+        total_gen_loss = gen_loss + dist_loss
     
-    # Remove local copy
-    os.remove(file_name)
-    
-    return response
+        # Backprop
+        total_gen_loss.backward()
+
+        # Update generator's weights
+        gen_opt.step()
+        gen_opt.zero_grad()
+
+    return (
+        np.mean(critic_losses_real)**0.5, 
+        np.mean(critic_losses_fake)**0.5, 
+        np.mean(gen_losses)**0.5,
+        np.mean(dist_losses)
+        
+    )
