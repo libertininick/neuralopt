@@ -225,35 +225,18 @@ cycle_len = 100
 lrs = lr_schedule(
     n_steps=len(datasets['train'])//batch_size + 1, 
     lr_min=0.00001, 
-    lr_max=0.005
+    lr_max=0.003
 )
 q = [0.05,0.25,0.5,0.75,0.95]
 
 st = time.time()
 best_train_loss, best_valid_loss = np.inf, np.inf
 for e in range(20):
-    
-    # Load data into memory
-    if e%5 == 0:
-        batches_train = [
-            batch 
-            for batch 
-            in DataLoader(datasets['train'], batch_size=batch_size, shuffle=True, num_workers=3)
-        ]
-
-        batches_valid = [
-            batch 
-            for batch 
-            in DataLoader(datasets['valid'], batch_size=batch_size, shuffle=True, num_workers=3)
-        ]
-        print(f'Data loaded {(time.time() - st)/60:>7.2f}m')
-        
-    
     # Training Loop
     model.train()
     train_losses = {'recon': [], 'LCH': [], 'dists': [], 'total': []}
-    np.random.shuffle(batches_train)
-    for b_i, batch in enumerate(batches_train):
+    loader = DataLoader(datasets['train'], batch_size=batch_size, shuffle=True, num_workers=3)
+    for b_i, batch in enumerate(loader):
         
         set_lr(optimizer, lrs[b_i])
         
@@ -274,7 +257,8 @@ for e in range(20):
     # Validation Loop
     model.eval()
     valid_losses = {'recon': [], 'LCH': [], 'dists': [], 'total': []}
-    for b_i, batch in enumerate(batches_valid):
+    loader = DataLoader(datasets['valid'], batch_size=batch_size, shuffle=True, num_workers=3)
+    for b_i, batch in enumerate(loader):
         with torch.no_grad():
             *component_losses, total_loss = feature_learning_loss(model, batch)
         losses_i = (*component_losses, total_loss.item())
@@ -289,10 +273,10 @@ for e in range(20):
         np.quantile(valid_losses['dists'], q=q).round(3),
     )
     
-    if (np.mean(train_losses['total']) <= best_train_loss 
-        and np.mean(valid_losses['total']) <= best_valid_loss):
-        torch.save(model.state_dict(), '../models/price_series_featurizer_wts.pth')
-        best_train_loss, best_valid_loss = np.mean(train_losses['total']), np.mean(valid_losses['total'])
+    train_loss, valid_loss = np.mean(train_losses['total']), np.mean(valid_losses['total'])
+    if train_loss <= best_train_loss and valid_loss <= best_valid_loss:
+        torch.save(model.state_dict(), '../models/price_series_featurizer_wts_2.pth')
+        best_train_loss, best_valid_loss = train_loss, valid_loss
         print('*** Model saved')
     else:
         print('!!! Model NOT saved')
@@ -304,12 +288,12 @@ for e in range(20):
 # +
 model = PriceSeriesFeaturizer(
     n_features=64,
-    historical_seq_len=historical_seq_len,
-    future_seq_len=future_seq_len,
-    n_dist_targets=n_dist_targets,
+    historical_seq_len=512,
+    future_seq_len=32,
+    n_dist_targets=27,
 )
 
-model.load_state_dict(torch.load('../models/price_series_featurizer_wts.pth'))
+model.load_state_dict(torch.load('../models/price_series_featurizer_wts_1.pth'))
 
 model.eval()
 # -
