@@ -1,6 +1,6 @@
 
-# Base image - CUDA enabaled PyTorch
-FROM nvcr.io/nvidia/pytorch:21.04-py3
+# Base image: AWS DLC PyTorch 1.8.1 GPU training image
+FROM 763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-training:1.8.1-gpu-py36-cu111-ubuntu18.04
 
 # Make RUN commands use `bash --login`:
 SHELL ["/bin/bash", "--login", "-c"]

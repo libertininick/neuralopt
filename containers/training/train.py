@@ -1,5 +1,7 @@
 import argparse
 import glob
+import json
+import os
 import re
 from time import time
 
@@ -8,25 +10,74 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from data_utils import get_data_splits, PriceSeriesDataset
+from data_utils import PriceSeriesDataset
 from modules import PriceSeriesFeaturizer
 from training_utils import feature_learning_loss, train_feat_batch, lr_schedule, set_lr
+
+# Argument defaults
+arg_definitions = {
+    'input_dir': {
+        'flag': '--input_dir', 
+        'type': str, 
+        'default': '/opt/ml/input/data/all'
+    },
+    'model_dir': {
+        'flag': '--model_dir', 
+        'type': str, 
+        'default': '/opt/ml/model'
+    },
+    'output_dir': {
+        'flag': '--output_dir', 
+        'type': str, 
+        'default': '/opt/ml/output'
+    },
+    'p_valid': {
+        'flag': '--p_valid', 
+        'type': float, 
+        'default': 0.050
+    },
+    'p_test': {
+        'flag': '--p_test', 
+        'type': float, 
+        'default': 0.025
+    },
+    'historical_seq_len': {
+        'flag': '--historical_seq_len', 
+        'type': int, 
+        'default': 512
+    },
+    'future_seq_len': {
+        'flag': '--future_seq_len', 
+        'type': int, 
+        'default': 32
+    },
+    'n_dist_targets': {
+        'flag': '--n_dist_targets', 
+        'type': int, 
+        'default': 51
+    },
+    'n_features': {
+        'flag': '--n_features', 
+        'type': int, 
+        'default': 64
+    },
+    'batch_size': {
+        'flag': '--batch_size', 
+        'type': int, 
+        'default': 16
+    },
+    'epochs': {
+        'flag': '--epochs', 
+        'type': int, 
+        'default': 1
+    },
+}
 
 
 def define_hyperparameters():
     parser = argparse.ArgumentParser()
-    parser.add_argument("train", type=bool, default=True)
-    parser.add_argument("--input_dir", type=str, default='/opt/ml/input/data/all')
-    parser.add_argument("--model_dir", type=str, default='/opt/ml/model')
-    parser.add_argument("--output_dir", type=str, default='/opt/ml/output')
-    parser.add_argument("--p_valid", type=float, default=0.05)
-    parser.add_argument("--p_test", type=float, default=0.025)
-    parser.add_argument("--historical_seq_len", type=int, default=512)
-    parser.add_argument("--future_seq_len", type=int, default=32)
-    parser.add_argument("--n_dist_targets", type=int, default=27)
-    parser.add_argument("--n_features", type=int, default=64)
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--epochs", type=int, default=1)
+    for v in arg_definitions.values():
+        parser.add_argument(v['flag'], type=v['type'], default=v['default'])
     return parser
 
 
@@ -79,22 +130,43 @@ def create_datasets(
 
 def main():
     # Hyperparameters
-    args = vars(define_hyperparameters().parse_args())
+    hyperparm_path = '/opt/ml/input/config/hyperparameters.json'
+    if os.path.exists(hyperparm_path):
+        # Parse parmaters from hyperparameters.json
+        with open(hyperparm_path, 'r') as fp:
+            args = json.load(fp)
+    else:
+        # Parse parameters from command line
+        args, _ = define_hyperparameters().parse_known_args()
+        args = vars(args)
+
+    # Argument getter
+    def get_arg(key):
+        definition = arg_definitions.get(key)
+
+        if definition is None:
+            return None
+        else:
+            try:
+                value = args.get(key, definition['default'])
+                return definition['type'](value)
+            except:
+                return definition['default']
 
     # Log
-    out_dir = args.get('output_dir')
+    out_dir = get_arg('output_dir')
     st = time()
     log = f'{(time() - st)/60:>7.2f}m: Hyperparameters parsed\n'
 
     # Create datasets
     try:
         datasets = create_datasets(
-            data_dir=args.get('input_dir'), 
-            p_valid=args.get('p_valid'), 
-            p_test=args.get('p_test'),
-            historical_seq_len=args.get('historical_seq_len'),
-            future_seq_len=args.get('future_seq_len'),
-            n_dist_targets=args.get('n_dist_targets'),
+            data_dir=get_arg('input_dir'), 
+            p_valid=get_arg('p_valid'), 
+            p_test=get_arg('p_test'),
+            historical_seq_len=get_arg('historical_seq_len'),
+            future_seq_len=get_arg('future_seq_len'),
+            n_dist_targets=get_arg('n_dist_targets'),
         )
         log += f'{(time() - st)/60:>7.2f}m: Datasets created\n'
     except Exception as e:
@@ -114,10 +186,10 @@ def main():
     # Define model
     try:
         model = PriceSeriesFeaturizer(
-            n_features=args.get('n_features'),
-            historical_seq_len=args.get('historical_seq_len'),
-            future_seq_len=args.get('future_seq_len'),
-            n_dist_targets=args.get('n_dist_targets'),
+            n_features=get_arg('n_features'),
+            historical_seq_len=get_arg('historical_seq_len'),
+            future_seq_len=get_arg('future_seq_len'),
+            n_dist_targets=get_arg('n_dist_targets'),
         )
         model.to(device)
         optimizer = torch.optim.Adam(model.parameters())
@@ -133,7 +205,7 @@ def main():
         fp.write(log)
 
     # Training loop
-    batch_size = args.get('batch_size')
+    batch_size = get_arg('batch_size')
     cycle_len = 10000//batch_size
     lrs = lr_schedule(
         n_steps=len(datasets['train'])//batch_size + 1, 
@@ -143,9 +215,9 @@ def main():
     loss_quantiles = [0.05,0.25,0.5,0.75,0.95]
 
     best_train_loss, best_valid_loss = np.inf, np.inf
-    model_dir = args.get('model_dir')
+    model_dir = get_arg('model_dir')
     
-    for epoch in range(args.get('epochs')):
+    for epoch in range(get_arg('epochs')):
         # Training pass
         model.train()
         train_losses = {'recon': [], 'LCH': [], 'dists': [], 'total': []}
@@ -210,7 +282,7 @@ def main():
             # Save weights
             try:
                 model.to('cpu')
-                torch.save(model.state_dict(), f'{out_dir}/wts.pth')
+                torch.save(model.state_dict(), f'{model_dir}/wts.pth')
                 model.to(device)
             except Exception as e:
                 log = f'{(time() - st)/60:>7.2f}m: Model save {epoch:>3} FAILED\n'
