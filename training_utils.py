@@ -46,29 +46,39 @@ def save_state_dict_to_s3(model, file_name, bucket_name, subfolder=None):
     return response
 
 
-def sample_contrastive_pairs(h_emb, h_LCH, h_recon, n_pairs_per):
-    """Sample overlapping pairs with sequences 16 - 64 dim long"""
+def sample_contrastive_pairs(batch, featurizer, sample_len, n_pairs_per=1, device='cpu'):
+    """Sample overlapping seqpairs"""
+
+    h_emb = batch['historical_seq_emb'].to(device)
+    h_LCH = batch['historical_seq_LCH'].to(device)
+    h_LCH_masked = batch['historical_seq_LCH_masked'].to(device)
+    f_emb = batch['future_seq_emb'].to(device)
+
+    # Reconstructed LCH from featurizer forward pass
+    with torch.no_grad():
+        h_recon, *_ = featurizer(h_emb, h_LCH_masked, f_emb)
+
     seq_len = h_emb.shape[1]
     
-    size_a, size_b = 32, 32
+    buffer = np.ceil(sample_len*1.5).astype(int)
     
     # Randomly sample centers for LHS and RHS, so the windows overlap by at least 16 points
-    centers_a = np.random.randint(low=64 + 16, high=seq_len - 64 - 16, size=n_pairs_per)
-    centers_b = centers_a + np.random.randint(low=1, high=33, size=n_pairs_per) - 16
+    centers_a = np.random.randint(low=buffer, high=seq_len - buffer, size=n_pairs_per)
+    centers_b = centers_a + np.random.randint(low=1, high=sample_len + 1, size=n_pairs_per) - sample_len//2
     
     # Slice to LHS windows
     lhs_emb, lhs_LCH = [], []
     for c in centers_a:
-        lhs_emb.append(h_emb[:, c - size_a//2:c + size_a//2, :])
-        lhs_LCH.append(h_LCH[:, c - size_a//2:c + size_a//2, :])
+        lhs_emb.append(h_emb[:, c - sample_len//2:c + sample_len//2, :])
+        lhs_LCH.append(h_LCH[:, c - sample_len//2:c + sample_len//2, :])
     lhs_emb = torch.cat(lhs_emb, dim=0)
     lhs_LCH = torch.cat(lhs_LCH, dim=0)
 
     # Slide to RHS windows  
     rhs_emb, rhs_LCH = [], []
     for c in centers_b:
-        rhs_emb.append(h_emb[:, c - size_b//2:c + size_b//2, :])
-        rhs_LCH.append(h_recon[:, c - size_b//2:c + size_b//2, :])
+        rhs_emb.append(h_emb[:, c - sample_len//2:c + sample_len//2, :])
+        rhs_LCH.append(h_recon[:, c - sample_len//2:c + sample_len//2, :])
     rhs_emb = torch.cat(rhs_emb, dim=0)
     rhs_LCH = torch.cat(rhs_LCH, dim=0)
 
