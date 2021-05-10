@@ -20,6 +20,7 @@
 # %autoreload 2
 
 import glob
+import json
 import os
 import re
 import sys
@@ -60,7 +61,7 @@ from training_utils import feature_learning_loss, train_feat_batch, lr_schedule,
 # +
 p = re.compile(r'[^\\\\|\/]{1,100}(?=\.pkl$)')
 
-files = np.array(glob.glob('D:/opt/Price Transforms/*.pkl'))
+files = np.array(glob.glob('D:/opt/price_transforms/*.pkl'))
 symbols = np.array([p.findall(file)[0] for file in files])
 
 rnd = np.random.RandomState(1234)
@@ -79,7 +80,7 @@ idxs_test = np.setdiff1d(idxs_other, idxs_valid)
 # +
 historical_seq_len = 512
 future_seq_len = 32
-n_dist_targets = 27
+n_dist_targets = 51
 
 datasets = {
     'train': PriceSeriesDataset(
@@ -204,22 +205,31 @@ baseline_losses
 
 # # Train
 
-model = PriceSeriesFeaturizer(
-    n_features=64,
-    historical_seq_len=historical_seq_len,
-    future_seq_len=future_seq_len,
-    n_dist_targets=n_dist_targets,
-)
+# +
+model_config = {
+    'n_features': 128,
+    'historical_seq_len': 512,
+    'future_seq_len': 32,
+    'n_dist_targets': 51,
+    'dropout': 0
+}
+
+with open(f'../models/featurizer/model_config.json', 'w') as fp:
+    json.dump(model_config, fp)
+
+model = PriceSeriesFeaturizer(**model_config)
 optimizer = torch.optim.Adam(model.parameters())
+# -
 
 # ## Testing
 
 batch = next(iter(DataLoader(datasets['train'], batch_size=128, shuffle=True)))
 feature_learning_loss(model, batch)
 
+# + [markdown] heading_collapsed=true
 # ## Training Loop
 
-# +
+# + hidden=true
 batch_size = 128
 cycle_len = 100
 lrs = lr_schedule(
@@ -275,7 +285,7 @@ for e in range(20):
     
     train_loss, valid_loss = np.mean(train_losses['total']), np.mean(valid_losses['total'])
     if train_loss <= best_train_loss and valid_loss <= best_valid_loss:
-        torch.save(model.state_dict(), '../models/price_series_featurizer_wts_2.pth')
+        torch.save(model.state_dict(), '../models/featurizer/wts_2.pth')
         best_train_loss, best_valid_loss = train_loss, valid_loss
         print('*** Model saved')
     else:
@@ -285,18 +295,11 @@ for e in range(20):
 # -
 # # Eval
 
-# +
-model = PriceSeriesFeaturizer(
-    n_features=64,
-    historical_seq_len=512,
-    future_seq_len=32,
-    n_dist_targets=27,
-)
-
-model.load_state_dict(torch.load('../models/price_series_featurizer_wts_1.pth'))
-
+with open(f'../models/featurizer/model_config.json', 'r') as fp:
+    model_config = json.load(fp)
+model = PriceSeriesFeaturizer(**model_config)
+model.load_state_dict(torch.load('../models/featurizer/wts.pth'))
 model.eval()
-# -
 
 # ## Test losses
 
@@ -315,48 +318,6 @@ print(
     np.quantile(test_losses['LCH'], q=q).round(3),
     np.quantile(test_losses['dists'], q=q).round(3),
 )
-# -
-
-# ## Vector scatter
-
-# +
-from eval_utils import SequenceVectorizer, Manifold
-
-batch = next(iter(DataLoader(datasets['train'], batch_size=1000, shuffle=True)))
-
-vectorizer = SequenceVectorizer(
-    enc_func=model.encode, 
-    n_common=2, 
-    n_ref_samples=500, 
-    seed=1234
-).fit(batch['historical_seq_emb'], batch['historical_seq_LCH'])
-
-v = vectorizer.vectorize_seq(batch['future_seq_emb'], batch['future_seq_LCH'])
-
-manifold = Manifold(k=5).fit(v)
-fig, ax = manifold.plot_manifold(figsize=(15,15))
-
-# +
-from scipy.spatial.distance import cdist
-
-idx=3
-dists = cdist(v, v[idx][None,:], metric='cosine').squeeze()
-
-# Similarity hist
-fig, ax = plt.subplots(figsize=(15,5))
-_ = ax.hist(
-    1 - dists[np.arange(len(dists)) != idx], 
-    bins=30, 
-    edgecolor='black',
-    alpha=0.5
-)
-_ = ax.set_xlim(-1,1)
-
-idxs = np.argsort(dists)
-fig, ax = plt.subplots(figsize=(15,7))
-_ = ax.plot([0]+np.cumsum(batch['future_seq_LCH'][idx,:,1]).tolist(), color='red')
-for i in range(1,4):
-    _ = ax.plot([0]+np.cumsum(batch['future_seq_LCH'][idxs[i],:,1]).tolist(), color='black', alpha=0.25)
 # -
 
 # ## Historical weights viewer
