@@ -348,6 +348,84 @@ class PriceSeriesFeaturizer(nn.Module):
         return h_LCH, f_LCH, f_ret_probas
 
 
+class PriceSeriesVectorizer(nn.Module):
+    def __init__(
+        self, 
+        encoding_fxn,
+        in_features,
+        seq_len,
+        out_features,
+        dropout=0):
+
+        super().__init__()
+
+        # Encoders
+        self.in_features = in_features
+        self.encoding_base = encoding_fxn
+        self.encoding_head = EncoderBlock(
+            in_features=in_features,
+            out_features=in_features,
+            max_seq_len=seq_len,
+            rnn_kernel_size=seq_len,
+            dropout=dropout
+        )
+
+        # Learnable weights
+        self.wt_transformer = nn.Linear(in_features, 1)
+        self.softmax = nn.Softmax(dim=-1)
+
+        # Positional weights
+        pos_wts = torch.arange(seq_len) + 1
+        pos_wts = pos_wts/torch.sum(pos_wts)
+        self.rhs_wts = nn.parameter.Parameter(
+            data=pos_wts[None, :, None], 
+            requires_grad=False
+        )
+        self.lhs_wts = nn.parameter.Parameter(
+            data=torch.flip(pos_wts, dims=(0,))[None, :, None], 
+            requires_grad=False
+        )
+        
+        # Vectorizer
+        self.vectorizer = nn.Sequential(
+            nn.BatchNorm1d(num_features=in_features*3),
+            nn.Linear(in_features=in_features*3, out_features=in_features),
+            nn.ReLU(),
+            nn.BatchNorm1d(num_features=in_features),
+            nn.Linear(in_features=in_features, out_features=out_features),
+        )
+
+    def forward(self, x_emb, x_LCH):
+        batch_size, seq_len = x_emb.shape[:2]
+        
+        # Encode sequence with base encoder
+        with torch.no_grad():
+            x = self.encoding_base(x_emb, x_LCH)
+
+        # Run encoded sequence through learnable encoding head
+        x = self.encoding_head(x)
+
+        # Calc learnable weights
+        wts = self.wt_transformer(x.reshape(batch_size*seq_len, -1))
+        wts = wts.reshape(batch_size, seq_len)
+        wts = self.softmax(wts)
+        wts = wts.reshape(batch_size, seq_len, 1)
+
+        # Average seq with learnable weights & positional weights and cat avgs together
+        learn = torch.sum(x*wts, dim=1)
+        lhs = torch.sum(x*self.lhs_wts, dim=1)
+        rhs = torch.sum(x*self.rhs_wts, dim=1)
+        x = torch.cat((learn, lhs, rhs), dim=-1)
+
+        # Flatten sequence to pass to vectorizer
+        v = self.vectorizer(x)
+
+        # L2 normalization
+        v = v/v.norm(dim=-1, p=2, keepdim=True)
+
+        return v
+
+
 class AdaptiveInstanceNormalization(nn.Module):
     def __init__(self, seq_len, n_features):
         super().__init__()
