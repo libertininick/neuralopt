@@ -86,6 +86,28 @@ def get_trading_days_left(dt):
     return np.sum(trading_dates > dt)
 
 
+def get_ret_dist_thresholds(n_targets, tails=[5, 7.5, 10]):
+    """Returns target values from normal distribution based
+    on an equal spacing of probabilities from 0.5% to 99.5%
+
+    Tails are augmented with "extreme" values 
+
+    Args:
+        n_targets (int): Number of threshold targets to generate
+        tails (list): Extreme thresholds
+
+    Returns:
+        threshold_targets (ndarray): (n_targets,)
+    """
+    lh_tails = [-t for t in tails[::-1]]
+    norms = list(norm.ppf(np.linspace(0.005, 0.995, n_targets - len(tails)*2)))
+    rh_tails = tails
+
+    threshold_targets =  np.array(lh_tails + norms + rh_tails)
+
+    return threshold_targets
+
+
 def transform_prices(df_prices, mean_window=260, std_window=10):
     """Transforms raw price data to model inputs
     
@@ -715,7 +737,7 @@ class PriceSeriesDataset(Dataset):
         self.p_mask = p_mask
         self.rnd = np.random.RandomState(seed)
         
-        self.target_thresholds = norm.ppf(np.linspace(0.001, 0.999, n_dist_targets))
+        self.target_thresholds = get_ret_dist_thresholds(n_dist_targets)
         
         self.cols_emb = [
             'month',
