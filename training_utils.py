@@ -263,9 +263,8 @@ def calculate_critic_loss(critic, context, real, fake, penalty_wt, device='cpu')
 
 
 def ret_distribution_loss(LCH_samples, ret_probas):
-    """Measures the mean squared distances between the qth sample 
-    and the target value for that quantile for each period in the 
-    generated sample of sequences.
+    """Measures the "distances" between the qth sample and the target value for that quantile 
+    for each period in the generated sample of sequences.
     
     Quantiles are given by the predicted return distribution probabilities
     
@@ -297,7 +296,15 @@ def ret_distribution_loss(LCH_samples, ret_probas):
             samples_ij = cumulative_CC_norms[i,:,j]
             q_ij = ret_probas[i,j,:]  # Predicted quantiles ith sample, jth period
             quantiles_ij = torch.quantile(samples_ij, q=q_ij)  # Quantile values from generated samples
-            losses.append(torch.mean((quantiles_ij - targets)**2))  # Spread between generated values and targets
+
+            # ABS spread between generated values and targets
+            spread = torch.abs(quantiles_ij - targets)
+
+            # Scale for spread
+            scale = torch.maximum(torch.abs(quantiles_ij), torch.abs(targets))
+            scaled_spread = spread/(2*scale)
+            
+            losses.append(torch.mean(scaled_spread))  
 
     return sum(losses)/len(losses)
 
