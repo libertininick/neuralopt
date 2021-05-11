@@ -20,6 +20,7 @@
 # %autoreload 2
 
 import glob
+import json
 import os
 import re
 import sys
@@ -51,9 +52,9 @@ mpl.rcParams['figure.facecolor'] = 'white'
 mpl.rcParams['axes.facecolor'] = 'white'
 
 from data_utils import get_data_splits, PriceSeriesDataset
-from modules import PriceSeriesFeaturizer, PriceSeriesGenerator, PriceSeriesCritic
+from modules import PriceSeriesFeaturizer, PriceSeriesVectorizer, PriceSeriesGenerator, PriceSeriesCritic
 from training_utils import lr_schedule, set_lr, train_GC_least_square_batch
-from eval_utils import SequenceVectorizer, Manifold
+from eval_utils import Manifold, precision_recall_f1
 # -
 
 # # Data Sets
@@ -61,7 +62,7 @@ from eval_utils import SequenceVectorizer, Manifold
 # +
 p = re.compile(r'[^\\\\|\/]{1,100}(?=\.pkl$)')
 
-files = np.array(glob.glob('D:/opt/Price Transforms/*.pkl'))
+files = np.array(glob.glob('D:/opt/price_transforms/*.pkl'))
 symbols = np.array([p.findall(file)[0] for file in files])
 
 rnd = np.random.RandomState(1234)
@@ -111,41 +112,58 @@ print(f'''Valid: {len(datasets['valid']):>12,}''')
 print(f'''Test : {len(datasets['test']):>12,}''')
 # -
 
-# # Load Price Series Featurization model
+# # Load featurizer
+
+with open(f'../models/featurizer/model_config.json', 'r') as fp:
+    model_config = json.load(fp)
+featurizer = PriceSeriesFeaturizer(**model_config)
+featurizer.load_state_dict(torch.load('../models/featurizer/wts.pth'))
+featurizer.eval()
+
+# # Load vectorizer
 
 # +
-featurizer = PriceSeriesFeaturizer(
-    n_features=64,
-    historical_seq_len=historical_seq_len,
-    future_seq_len=future_seq_len,
-    n_dist_targets=n_dist_targets,
-)
-
-featurizer.load_state_dict(torch.load('../models/price_series_featurizer_wts.pth'))
-
-featurizer.eval()
+with open('../models/vectorizer/model_config.json', 'r') as fp:
+    model_config = json.load(fp)
+    
+vectorizer = PriceSeriesVectorizer(encoding_fxn=featurizer.encode, **model_config)
+vectorizer.load_state_dict(torch.load('../models/vectorizer/wts.pth'))
+vectorizer.eval()
 # -
 
-# # Fit vectorizer for precision/recall manifolds
+# # Vectorize "real" seq for precision/recall calculations
 
-# +
-vectorizer_loader = DataLoader(datasets['valid'], batch_size=1000, shuffle=True, num_workers=3)
-vectorizer_batch = next(iter(vectorizer_loader))
-
-vectorizer = SequenceVectorizer(
-    enc_func=featurizer.encode, 
-    n_common=2, 
-    n_ref_samples=500, 
-    seed=1234
-).fit(vectorizer_batch['historical_seq_emb'], vectorizer_batch['historical_seq_LCH'])
-
-# +
 v_real = [] 
 for batch in DataLoader(datasets['valid'], batch_size=128, shuffle=True, num_workers=3):
-    v_real.append(vectorizer.vectorize_seq(batch['future_seq_emb'], batch['future_seq_LCH']))
-
+    with torch.no_grad():
+        v = vectorizer(batch['future_seq_emb'], batch['future_seq_LCH'])
+        v_real.append(v.numpy())
 v_real = np.concatenate(v_real, axis=0)
+
+# ## Precision/recall baseline
+
+# +
+k = 5
+n = len(v_real)
+idxs = np.arange(n)
+rnd = np.random.RandomState(1234)
+
+f1_scores = []
+for _ in range(10):
+    idxs_a = rnd.choice(idxs, size=n//2, replace=False)
+    idxs_b = np.setdiff1d(idxs, idxs_a, assume_unique=True)
+    
+    v_a = v_real[idxs_a]
+    v_b = v_real[idxs_b]
+    
+    *_, f1 = precision_recall_f1(v_a, v_b, k)
+    f1_scores.append(f1)
+    
+f1_baseline = np.max(f1_scores)
+f1_baseline
 # -
+
+# ## Validation manifold
 
 manifold_real = Manifold(k=5).fit(v_real)
 fig, ax = manifold_real.plot_manifold(figsize=(15,15))
@@ -184,18 +202,14 @@ for batch in DataLoader(datasets['valid'], batch_size=128, shuffle=True, num_wor
         )
         
         lch = generator(context, batch['future_seq_emb'], noise)
-    
-    v_fake.append(vectorizer.vectorize_seq(batch['future_seq_emb'], lch))
+        v = vectorizer(batch['future_seq_emb'], lch)
+        v_fake.append(v.numpy())
 
 v_fake = np.concatenate(v_fake, axis=0)
 # -
 
-manifold_fake = Manifold(k=5).fit(v_fake)
-fig, ax = manifold_fake.plot_manifold(figsize=(15,15))
-
-precision = manifold_real.predict(v_fake)
-recall = manifold_fake.predict(v_real)
-print(f'Precision: {np.mean(precision):.2%}, Recall: {np.mean(recall):.2%}')
+precision, recall, f1 = precision_recall_f1(v_real, v_fake, k)
+print(f'Precision: {precision:.2%}, Recall: {recall:.2%}, F1: {f1:.2%}')
 
 # ## Test batch
 
@@ -234,13 +248,14 @@ lrs = lr_schedule(
 lr_mean = np.mean(lrs)
 
 featurizer.eval()
-generator.train()
 critic.train()
-
 st = time.time()
+best_valid_f1 = 0
 for e in range(5):
-    loader = DataLoader(datasets['train'], batch_size=batch_size, shuffle=True, num_workers=3)
     
+    # Training Loop
+    generator.train()
+    loader = DataLoader(datasets['train'], batch_size=batch_size, shuffle=True, num_workers=3)
     for b_i, batch in enumerate(loader):
 
         set_lr(critic_opt, lrs[b_i])
@@ -257,30 +272,53 @@ for e in range(5):
             ll.append(l_i)
 
         if (b_i + 1) % cycle_len == 0:
-            # Reset repeats
-            critic_avg = np.mean(
-                (np.array(losses['critic_real'][-cycle_len:]) + np.array(losses['critic_fake'][-cycle_len:]))/2
-            )
-            gen_avg = np.mean(losses['gen_real'][-cycle_len:])
-            ref_min = min(critic_avg, gen_avg)
-            n_critic_repeats = min(5, int(np.ceil(critic_avg/ref_min)))
-            n_gen_repeats = min(5, int(np.ceil(gen_avg/ref_min)))
+            # Swap repeats
+            n_critic_repeats, n_gen_repeats = n_gen_repeats, n_critic_repeats
             
             print(
                 e,
                 f'{b_i + 1:<7}',
                 f'{(time.time() - st)/60:>7.2f}m',
-                n_critic_repeats,
-                n_gen_repeats,
                 np.quantile(losses['critic_real'][-cycle_len:], q=q).round(3),
                 np.quantile(losses['critic_fake'][-cycle_len:], q=q).round(3),
                 np.quantile(losses['gen_real'][-cycle_len:], q=q).round(3),
                 np.quantile(losses['gen_dist'][-cycle_len:], q=q).round(3),
-            ) 
-# -
+            )
+            
+    # Validation Loop
+    generator.eval()
+    v_fake = []
+    loader = DataLoader(datasets['valid'], batch_size=batch_size, shuffle=True, num_workers=3)
+    for b_i, batch in enumerate(loader):
+        noise = generator.gen_noise(*batch['future_seq_emb'].shape[:2])
+        
+        with torch.no_grad():
+            context = featurizer.encode_future_path(
+                batch['historical_seq_emb'],
+                batch['historical_seq_LCH'],
+                batch['future_seq_emb']
+            )
 
-torch.save(generator.state_dict(), '../models/generator_wts_1.pth')
-torch.save(critic.state_dict(), '../models/critic_wts_1.pth')
+            lch = generator(context, batch['future_seq_emb'], noise)
+            v = vectorizer(batch['future_seq_emb'], lch)
+        v_fake.append(v.numpy())
+    v_fake = np.concatenate(v_fake, axis=0)
+    precision, recall, f1 = precision_recall_f1(v_real, v_fake, k)
+
+    print(
+        e,
+        f'Validation',
+        f'{(time.time() - st)/60:>7.2f}m',
+        f'Precision: {precision:.2%}, Recall: {recall:.2%}, F1: {f1:.2%}'
+    )
+    
+    if f1 > best_valid_f1:
+        torch.save(generator.state_dict(), '../models/generator/wts.pth')
+        best_valid_f1 = f1
+        print('*** Model saved')
+    else:
+        print('!!! Model NOT saved')
+# -
 
 # # Eval
 
