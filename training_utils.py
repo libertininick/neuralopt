@@ -9,6 +9,7 @@ from scipy.stats import norm
 import torch
 import torch.nn as nn
 
+
 def lr_schedule(n_steps, lr_min, lr_max):
     """Generates a concave learning rate schedule over
     `n_steps`, starting and ending at `lr_min` and
@@ -60,11 +61,13 @@ def sample_contrastive_pairs(batch, featurizer, sample_len, n_pairs_per=1, devic
 
     seq_len = h_emb.shape[1]
     
-    buffer = np.ceil(sample_len*1.5).astype(int)
-    
-    # Randomly sample centers for LHS and RHS, so the windows overlap by at least 16 points
+    # Randomly sample centers for LHS and RHS, so the windows overlap by at least 66% of points
+    p_shift = 1/3
+    buffer = np.ceil(sample_len*(1 + p_shift)).astype(int)
+    max_shift = int(sample_len)*p_shift
+    shifts = np.random.randint(low=-max_shift, high=max_shift + 1, size=n_pairs_per)
     centers_a = np.random.randint(low=buffer, high=seq_len - buffer, size=n_pairs_per)
-    centers_b = centers_a + np.random.randint(low=1, high=sample_len + 1, size=n_pairs_per) - sample_len//2
+    centers_b = centers_a + shifts
     
     # Slice to LHS windows
     lhs_emb, lhs_LCH = [], []

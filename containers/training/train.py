@@ -12,7 +12,14 @@ from torch.utils.data import DataLoader
 
 from data_utils import PriceSeriesDataset
 from modules import PriceSeriesFeaturizer
-from training_utils import feature_learning_loss, train_feat_batch, lr_schedule, set_lr
+from training_utils import (
+    feature_learning_loss, 
+    train_feat_batch, 
+    sample_contrastive_pairs, 
+    constrastive_loss,
+    lr_schedule, 
+    set_lr
+)
 
 # Argument defaults
 arg_definitions = {
@@ -49,7 +56,7 @@ arg_definitions = {
     'future_seq_len': {
         'flag': '--future_seq_len', 
         'type': int, 
-        'default': 32
+        'default': 64
     },
     'n_dist_targets': {
         'flag': '--n_dist_targets', 
@@ -59,15 +66,20 @@ arg_definitions = {
     'n_features': {
         'flag': '--n_features', 
         'type': int, 
-        'default': 64
+        'default': 128
     },
     'batch_size': {
         'flag': '--batch_size', 
         'type': int, 
-        'default': 16
+        'default': 64
     },
-    'epochs': {
-        'flag': '--epochs', 
+    'feat_epochs': {
+        'flag': '--feat_epochs', 
+        'type': int, 
+        'default': 1
+    },
+    'vec_epochs': {
+        'flag': '--vec_epochs', 
         'type': int, 
         'default': 1
     },
@@ -192,7 +204,6 @@ def main():
             n_dist_targets=get_arg('n_dist_targets'),
         )
         model.to(device)
-        optimizer = torch.optim.Adam(model.parameters())
         log += f'{(time() - st)/60:>7.2f}m: Model defined\n'
     except Exception as e:
         log += f'{(time() - st)/60:>7.2f}m: Model FAILED\n'
@@ -204,20 +215,25 @@ def main():
     with open(f'{out_dir}/log.txt','a') as fp:
         fp.write(log)
 
-    # Training loop
+    # Training parmeters
     batch_size = get_arg('batch_size')
     cycle_len = 10000//batch_size
     lrs = lr_schedule(
         n_steps=len(datasets['train'])//batch_size + 1, 
         lr_min=0.00001, 
-        lr_max=0.003*batch_size/128
+        lr_max=0.005
     )
     loss_quantiles = [0.05,0.25,0.5,0.75,0.95]
-
-    best_train_loss, best_valid_loss = np.inf, np.inf
     model_dir = get_arg('model_dir')
     
-    for epoch in range(get_arg('epochs')):
+
+    ### Featurization training loop ###
+    with open(f'{model_dir}/training_progress.txt','a') as fp:
+        fp.write('--- Feaurization Training ---\n\n')
+
+    optimizer = torch.optim.Adam(model.parameters())
+    best_train_loss, best_valid_loss = np.inf, np.inf
+    for epoch in range(get_arg('feat_epochs')):
         # Training pass
         model.train()
         train_losses = {'recon': [], 'LCH': [], 'dists': [], 'total': []}
@@ -300,6 +316,182 @@ def main():
 
         with open(f'{model_dir}/training_progress.txt','a') as fp:
             fp.write(f'{progress}\n')
+
+    # Testing pass
+    model.eval()
+    test_losses = {'recon': [], 'LCH': [], 'dists': [], 'total': []}
+    loader = DataLoader(datasets['test'], batch_size=batch_size, shuffle=True, num_workers=3)
+    for b_i, batch in enumerate(loader):
+        # Evaluate on batch
+        try:
+            with torch.no_grad():
+                *component_losses, total_loss = feature_learning_loss(model, batch, device)
+        except Exception as e:
+            log = f'{(time() - st)/60:>7.2f}m: Testing batch {epoch:>3} {b_i + 1:<10,} FAILED\n'
+            log += f'Exception: {str(e)}'
+            with open(f'{out_dir}/log.txt','a') as fp:
+                fp.write(log)
+            raise
+        
+        # Extract losses
+        losses_i = (*component_losses, total_loss.item())
+        for ll, l_i in zip(test_losses.values(), losses_i):
+            ll.append(l_i)
+
+    progress = (
+        f'{(time() - st)/60:>7.2f}m: {epoch:>3} Testing   ' +
+        f''' { np.quantile(test_losses['recon'], q=loss_quantiles).round(3)}''' +
+        f''' { np.quantile(test_losses['LCH'], q=loss_quantiles).round(3)}''' + 
+        f''' { np.quantile(test_losses['dists'], q=loss_quantiles).round(3)}'''
+    )
+    with open(f'{model_dir}/training_progress.txt','a') as fp:
+        fp.write(f'{progress}\n')
+
+
+
+    ### Vectorization training loop ###
+    with open(f'{model_dir}/training_progress.txt','a') as fp:
+        fp.write('\n\n\n\n--- Vectorization Training ---\n\n')
+
+    optimizer = torch.optim.Adam(model.parameters())
+    n_pairs_per = int(get_arg('historical_seq_len')/get_arg('future_seq_len')/2)
+    best_train_loss, best_valid_loss = np.inf, np.inf
+    for epoch in range(get_arg('vec_epochs')):
+        # Training pass
+        model.train()
+        train_losses = []
+        loader = DataLoader(datasets['train'], batch_size=batch_size, shuffle=True, num_workers=3)
+        for b_i, batch in enumerate(loader):
+            # Train on batch
+            try:
+                set_lr(optimizer, lrs[b_i])
+
+                # Sample contrastive pairs
+                lhs, rhs = sample_contrastive_pairs(
+                    batch, 
+                    model, 
+                    sample_len=get_arg('future_seq_len'), 
+                    n_pairs_per=n_pairs_per, 
+                    device=device
+                )
+
+                # Vectorize
+                lhs_v = model.vectorize_seq(*lhs)
+                rhs_v = model.vectorize_seq(*rhs)
+
+                # Contrastive loss
+                loss_i = constrastive_loss(lhs_v, rhs_v, temp=0.1)
+                train_losses.append(loss_i.item())
+
+                # Backprop
+                loss_i.backward()
+                optimizer.step()
+        
+                # Cleanup
+                optimizer.zero_grad()
+            except Exception as e:
+                log = f'{(time() - st)/60:>7.2f}m: Batch {epoch:>3} {b_i + 1:<10,} FAILED\n'
+                log += f'Exception: {str(e)}'
+                with open(f'{out_dir}/log.txt','a') as fp:
+                    fp.write(log)
+                raise
+
+            if (b_i + 1) % cycle_len == 0:
+                progress = (
+                    f'{(time() - st)/60:>7.2f}m: {epoch:>3} {b_i + 1:<10,}' +
+                    f''' { np.quantile(train_losses[-cycle_len:], q=loss_quantiles).round(3)}'''
+                )
+                with open(f'{model_dir}/training_progress.txt','a') as fp:
+                    fp.write(f'{progress}\n')
+
+        # Validation pass
+        model.eval()
+        valid_losses = []
+        loader = DataLoader(datasets['valid'], batch_size=batch_size, shuffle=True, num_workers=3)
+        for b_i, batch in enumerate(loader):
+            # Evaluate on batch
+            try:
+                lhs, rhs = sample_contrastive_pairs(
+                    batch, 
+                    model, 
+                    sample_len=get_arg('future_seq_len'), 
+                    n_pairs_per=n_pairs_per, 
+                    device=device
+                )
+                with torch.no_grad():
+                    lhs_v = model.vectorize_seq(*lhs)
+                    rhs_v = model.vectorize_seq(*rhs)
+                    loss_i = constrastive_loss(lhs_v, rhs_v, temp=0.1)
+                    valid_losses.append(loss_i.item())
+            except Exception as e:
+                log = f'{(time() - st)/60:>7.2f}m: Validation batch {epoch:>3} {b_i + 1:<10,} FAILED\n'
+                log += f'Exception: {str(e)}'
+                with open(f'{out_dir}/log.txt','a') as fp:
+                    fp.write(log)
+                raise
+
+        progress = (
+            f'{(time() - st)/60:>7.2f}m: {epoch:>3} Validation' +
+            f''' { np.quantile(valid_losses, q=loss_quantiles).round(3)}'''
+        )
+        
+        # Checkpoint
+        train_loss, valid_loss = np.mean(train_losses), np.mean(valid_losses)
+        if train_loss <= best_train_loss and valid_loss <= best_valid_loss:
+            # Save weights
+            try:
+                model.to('cpu')
+                torch.save(model.state_dict(), f'{model_dir}/wts.pth')
+                model.to(device)
+            except Exception as e:
+                log = f'{(time() - st)/60:>7.2f}m: Model save {epoch:>3} FAILED\n'
+                log += f'Exception: {str(e)}'
+                with open(f'{out_dir}/log.txt','a') as fp:
+                    fp.write(log)
+                raise
+            
+            # Update best losses
+            best_train_loss, best_valid_loss = train_loss, valid_loss
+            
+            progress += '\n*** Model saved'
+        else:
+            progress += '\n!!! Model NOT saved'
+
+        with open(f'{model_dir}/training_progress.txt','a') as fp:
+            fp.write(f'{progress}\n')
+
+    # Testing pass
+    model.eval()
+    test_losses = []
+    loader = DataLoader(datasets['test'], batch_size=batch_size, shuffle=True, num_workers=3)
+    for b_i, batch in enumerate(loader):
+        # Evaluate on batch
+        try:
+            lhs, rhs = sample_contrastive_pairs(
+                batch, 
+                model, 
+                sample_len=get_arg('future_seq_len'), 
+                n_pairs_per=n_pairs_per, 
+                device=device
+            )
+            with torch.no_grad():
+                lhs_v = model.vectorize_seq(*lhs)
+                rhs_v = model.vectorize_seq(*rhs)
+                loss_i = constrastive_loss(lhs_v, rhs_v, temp=0.1)
+                test_losses.append(loss_i.item())
+        except Exception as e:
+            log = f'{(time() - st)/60:>7.2f}m: Testing batch {epoch:>3} {b_i + 1:<10,} FAILED\n'
+            log += f'Exception: {str(e)}'
+            with open(f'{out_dir}/log.txt','a') as fp:
+                fp.write(log)
+            raise
+
+    progress = (
+        f'{(time() - st)/60:>7.2f}m: {epoch:>3} Testing   ' +
+        f''' { np.quantile(test_losses, q=loss_quantiles).round(3)}'''
+    )
+    with open(f'{model_dir}/training_progress.txt','a') as fp:
+        fp.write(f'{progress}\n')
 
 
 if __name__ == "__main__":

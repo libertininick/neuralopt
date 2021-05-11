@@ -31,6 +31,7 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 import numpy as np
 import pandas as pd
+from scipy.spatial.distance import cdist
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -53,7 +54,15 @@ mpl.rcParams['axes.facecolor'] = 'white'
 
 from data_utils import get_data_splits, PriceSeriesDataset
 from modules import PriceSeriesFeaturizer
-from training_utils import feature_learning_loss, train_feat_batch, lr_schedule, set_lr
+from training_utils import (
+    feature_learning_loss, 
+    train_feat_batch, 
+    sample_contrastive_pairs, 
+    constrastive_loss,
+    lr_schedule, 
+    set_lr
+)
+from eval_utils import Manifold
 # -
 
 # # Data Set
@@ -79,7 +88,7 @@ idxs_test = np.setdiff1d(idxs_other, idxs_valid)
 
 # +
 historical_seq_len = 512
-future_seq_len = 32
+future_seq_len = 64
 n_dist_targets = 51
 
 datasets = {
@@ -209,9 +218,9 @@ baseline_losses
 model_config = {
     'n_features': 128,
     'historical_seq_len': 512,
-    'future_seq_len': 32,
+    'future_seq_len': 64,
     'n_dist_targets': 51,
-    'dropout': 0
+    'dropout': 0.05
 }
 
 with open(f'../models/featurizer/model_config.json', 'w') as fp:
@@ -221,15 +230,26 @@ model = PriceSeriesFeaturizer(**model_config)
 optimizer = torch.optim.Adam(model.parameters())
 # -
 
-# ## Testing
+# ## Loss testing
 
-batch = next(iter(DataLoader(datasets['train'], batch_size=128, shuffle=True)))
+batch = next(iter(DataLoader(datasets['train'], batch_size=64, shuffle=True)))
 feature_learning_loss(model, batch)
 
-# + [markdown] heading_collapsed=true
-# ## Training Loop
+n_pairs_per = int(historical_seq_len/future_seq_len/2)
+lhs, rhs = sample_contrastive_pairs(
+    batch, 
+    model, 
+    sample_len=future_seq_len, 
+    n_pairs_per=n_pairs_per, 
+    device='cpu'
+)
+lhs_v = model.vectorize_seq(*lhs)
+rhs_v = model.vectorize_seq(*rhs)
+constrastive_loss(lhs_v, rhs_v, temp=0.1)
 
-# + hidden=true
+# ## Featurizer training loop
+
+# +
 batch_size = 128
 cycle_len = 100
 lrs = lr_schedule(
@@ -285,7 +305,7 @@ for e in range(20):
     
     train_loss, valid_loss = np.mean(train_losses['total']), np.mean(valid_losses['total'])
     if train_loss <= best_train_loss and valid_loss <= best_valid_loss:
-        torch.save(model.state_dict(), '../models/featurizer/wts_2.pth')
+        torch.save(model.state_dict(), '../models/featurizer/wts.pth')
         best_train_loss, best_valid_loss = train_loss, valid_loss
         print('*** Model saved')
     else:
@@ -293,6 +313,87 @@ for e in range(20):
 
 
 # -
+# ## Vectorizer training loop
+
+# +
+n_pairs_per = int(historical_seq_len/future_seq_len/2)
+batch_size = 128
+cycle_len = 10000//batch_size
+lrs = lr_schedule(
+    n_steps=len(datasets['train'])//batch_size + 1, 
+    lr_min=0.00001, 
+    lr_max=0.003
+)
+loss_quantiles = [0.05,0.25,0.5,0.75,0.95]
+
+st = time.time()
+best_train_loss, best_valid_loss = np.inf, np.inf
+for e in range(3):
+    
+    # Training Loop
+    model.train()
+    train_losses = []
+    loader = DataLoader(datasets['train'], batch_size=batch_size, shuffle=True, num_workers=3)
+    for b_i, batch in enumerate(loader):
+        
+        set_lr(optimizer, lrs[b_i])
+        
+        # Sample contrastive pairs
+        lhs, rhs = sample_contrastive_pairs(batch, model, future_seq_len, n_pairs_per, device)
+        
+        # Vectorize
+        lhs_v = model.vectorize_seq(*lhs)
+        rhs_v = model.vectorize_seq(*rhs)
+        
+        # Contrastive loss
+        loss_i = constrastive_loss(lhs_v, rhs_v, temp=0.1)
+        train_losses.append(loss_i.item())
+        
+        # Backprop
+        loss_i.backward()
+        optimizer.step()
+        
+        # Cleanup
+        optimizer.zero_grad()
+    
+        if (b_i + 1) % cycle_len == 0:
+            print(
+                e,
+                f'{b_i + 1:>10,}',
+                f'{(time.time() - st)/60:>7.2f}m',
+                np.quantile(train_losses[-cycle_len:], q=loss_quantiles).round(3),
+            )
+
+    # Validation Loop
+    model.eval()
+    valid_losses = []
+    loader = DataLoader(datasets['valid'], batch_size=batch_size, shuffle=True, num_workers=3)
+    for b_i, batch in enumerate(loader):
+        # Sample contrastive pairs
+        lhs, rhs = sample_contrastive_pairs(batch, model, future_seq_len, n_pairs_per, device)
+        
+        with torch.no_grad():
+            lhs_v = model.vectorize_seq(*lhs)
+            rhs_v = model.vectorize_seq(*rhs)
+            loss_i =  constrastive_loss(lhs_v, rhs_v, temp=0.1)
+            valid_losses.append(loss_i.item())
+
+    print(
+        e,
+        f'Validation',
+        f'{(time.time() - st)/60:>7.2f}m',
+        np.quantile(valid_losses, q=loss_quantiles).round(3),
+    )
+    
+    train_loss, valid_loss = np.mean(train_losses), np.mean(valid_losses)
+    if train_loss <= best_train_loss and valid_loss <= best_valid_loss:
+        torch.save(model.state_dict(), '../models/featurizer/wts.pth')
+        best_train_loss, best_valid_loss = train_loss, valid_loss
+        print('*** Model saved')
+    else:
+        print('!!! Model NOT saved')
+# -
+
 # # Eval
 
 with open(f'../models/featurizer/model_config.json', 'r') as fp:
@@ -340,22 +441,22 @@ _ = ax.plot(
     label='Day 2'
 )
 _ = ax.plot(
-    [0] + list(np.cumsum(wts[:,5][::-1])),
+    [0] + list(np.cumsum(wts[:,14][::-1])),
     alpha=0.5,
     color='orange',
-    label='Day 5'
+    label='Day 15'
 )
 _ = ax.plot(
-    [0] + list(np.cumsum(wts[:,15][::-1])),
+    [0] + list(np.cumsum(wts[:,31][::-1])),
     alpha=0.5,
     color='red',
-    label='Day 15'
+    label='Day 32'
 )
 _ = ax.plot(
     [0] + list(np.cumsum(wts[:,-1][::-1])),
     alpha=0.5,
     color='purple',
-    label='Day 32'
+    label='Day 64'
 )
 
 _ = ax.plot(
@@ -389,8 +490,8 @@ with torch.no_grad():
 
 
 fig, axs = plt.subplots(ncols=3, figsize=(5,15))
-_ = axs[0].imshow(batch['historical_seq_LCH'][0, :40, :3], cmap='RdBu', vmin=-3, vmax=3)
-_ = axs[1].imshow(batch['historical_seq_LCH_masked'][0, :40, :3], cmap='RdBu', vmin=-3, vmax=3)
+_ = axs[0].imshow(batch['historical_seq_LCH'][0, :64, :3], cmap='RdBu', vmin=-3, vmax=3)
+_ = axs[1].imshow(batch['historical_seq_LCH_masked'][0, :64, :3], cmap='RdBu', vmin=-3, vmax=3)
 _ = axs[2].imshow(x_recon[0][:40], cmap='RdBu', vmin=-3, vmax=3)
 
 # ## Future path plotter
@@ -429,6 +530,46 @@ for i in range(len(f_ret_probas)):
 
 fig, ax = plt.subplots(figsize=(15,7))
 for i in range(len(f_ret_probas)):
+    _ = ax.plot(f_ret_probas[i,31,:].numpy(), '-o', color='black', alpha=0.05)
+
+# ### Day 64
+
+fig, ax = plt.subplots(figsize=(15,7))
+for i in range(len(f_ret_probas)):
     _ = ax.plot(f_ret_probas[i,-1,:].numpy(), '-o', color='black', alpha=0.05)
+
+# ## Vector manifold
+
+batch = next(iter(DataLoader(datasets['train'], batch_size=5000, shuffle=True)))
+with torch.no_grad():
+    v = model.vectorize_seq(batch['future_seq_emb'], batch['future_seq_LCH']).numpy()
+v.shape
+
+manifold = Manifold(k=5).fit(v)
+fig, ax = manifold.plot_manifold(figsize=(15,15))
+
+# ## Vector cosine sim
+
+# +
+idx=5
+dists = cdist(v, v[idx][None,:], metric='cosine').squeeze()
+
+# Similarity hist
+fig, ax = plt.subplots(figsize=(15,5))
+_ = ax.hist(
+    1 - dists[np.arange(len(dists)) != idx], 
+    bins=30, 
+    edgecolor='black',
+    alpha=0.5
+)
+_ = ax.set_xlim(-1,1)
+
+idxs = np.argsort(dists)
+fig, ax = plt.subplots(figsize=(15,7))
+_ = ax.plot([0]+np.cumsum(batch['future_seq_LCH'][idx,:,1]).tolist(), color='red')
+for i in range(1,6):
+    print(dists[idxs[i]])
+    _ = ax.plot([0]+np.cumsum(batch['future_seq_LCH'][idxs[i],:,1]).tolist(), color='black', alpha=0.25)
+# -
 
 
