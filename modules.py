@@ -426,39 +426,6 @@ class PriceSeriesVectorizer(nn.Module):
         return v
 
 
-class AdaptiveInstanceNormalization(nn.Module):
-    def __init__(self, seq_len, n_features):
-        super().__init__()
-
-        self.scale_mapper = nn.Sequential(
-            nn.Linear(n_features, n_features//2),
-            nn.ReLU(),
-            nn.Linear(n_features//2, seq_len)
-        )
-
-        self.bias_mapper = nn.Sequential(
-            nn.Linear(n_features, n_features//2),
-            nn.ReLU(),
-            nn.Linear(n_features//2, seq_len)
-        )
-
-    def forward(self, x, noise):
-        """
-        context (tensor): (batch_size, seq_len, n_features)
-        noise (tensor): (batch_size, n_features)
-        """
-
-        scale = self.scale_mapper(noise).unsqueeze(-1)
-        bias = self.bias_mapper(noise).unsqueeze(-1)
-
-        mu = torch.mean(x, dim=-1, keepdim=True)
-        std = torch.std(x, dim=-1, keepdim=True)
-
-        x = (x - mu)/std*scale + bias
-
-        return x
-
-
 class PriceSeriesGenerator(nn.Module):
     """Generative model for simulating a sequences of normalized returns given a historical context
     """
