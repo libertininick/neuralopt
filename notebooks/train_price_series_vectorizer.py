@@ -209,6 +209,7 @@ loss_quantiles = [0.05,0.25,0.5,0.75,0.95]
 st = time.time()
 best_train_loss, best_valid_loss = np.inf, np.inf
 for e in range(3):
+    
     # Training Loop
     model.train()
     train_losses = []
@@ -298,7 +299,7 @@ fig, ax = manifold.plot_manifold(figsize=(15,15))
 # ## Cosine sim
 
 # +
-idx=12
+idx=5
 dists = cdist(v, v[idx][None,:], metric='cosine').squeeze()
 
 # Similarity hist
