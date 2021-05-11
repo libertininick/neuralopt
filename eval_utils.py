@@ -36,6 +36,21 @@ def _remove_vectors(X, v):
     return X - X.dot(v.T).dot(v)
 
 
+def precision_recall_f1(v_a, v_b, k=5):
+    manifold_a = Manifold(k).fit(v_a)
+    manifold_b = Manifold(k).fit(v_b)
+    
+    predictions_ab = manifold_a.predict(v_b)  # Do points b lie in manifold a (precision)
+    predictions_ba = manifold_b.predict(v_a)  # Do points a lie in manifold b (recall)
+    
+    precision = np.mean(predictions_ab)
+    recall = np.mean(predictions_ba)
+    
+    f1 = 2*precision*recall/(precision + recall)
+
+    return precision, recall, f1
+
+
 class SequenceVectorizer():
     """Riff on "Simple but tough-to-beat baseline..." for combining 
     an encoded sequence into a single vector representation
